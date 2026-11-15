@@ -1,0 +1,14 @@
+{
+  "name": "pi-machine-config",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Explicit, portable Pi configuration capture and new-target restore planning.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test 'tests/*.test.ts'",
+    "cli": "node src/cli.ts"
+  }
+}

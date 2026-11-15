@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+# Fixture scratch only; production overlays and state must stay outside this repo.
+.local/
+.state/
+*.tsbuildinfo
+.DS_Store
