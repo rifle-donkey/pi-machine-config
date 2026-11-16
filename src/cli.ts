@@ -14,12 +14,18 @@ import { ToolError, invalid } from './errors.ts';
 import type { GuardContext } from './fsafe.ts';
 import { plan } from './plan.ts';
 import { PLATFORMS, type Platform } from './schema.ts';
+import { restoreFromPlan } from './restore.ts';
+import { inspectRestore, resolveRestore, rollbackRestore } from './transaction.ts';
 
 export const USAGE = `Usage:
   pi-machine-config capture-review --policy <file> --source-agent <dir> --platform <darwin|linux> [--source-lens-config <file>]
   pi-machine-config capture --policy <file> --source-agent <dir> --platform <darwin|linux> --out <new-dir> --approve-inclusion <token> [--source-lens-config <file>]
   pi-machine-config plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
-All paths must be absolute.
+  pi-machine-config apply --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> --state-dir <new-dir> --approve-activation <token> [--overlay <dir>] [--lens-config <new-file>]
+  pi-machine-config rollback --state-dir <dir> --target-agent <dir> --tx <id> [--lens-config <file>]
+  pi-machine-config recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
+  pi-machine-config recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
+All paths must be absolute. Real Pi locations remain refused.
 `;
 
 export interface CliOutput {
@@ -28,23 +34,31 @@ export interface CliOutput {
   stderr: string;
 }
 
-const SPECS: Record<string, { required: string[]; optional: string[] }> = {
+const SPECS: Record<string, { required: string[]; optional: string[]; flags?: string[] }> = {
   'capture-review': { required: ['policy', 'source-agent', 'platform'], optional: ['source-lens-config'] },
   // A missing approval is reported as `inclusion-approval-required`, not `usage`.
   capture: { required: ['policy', 'source-agent', 'platform', 'out'], optional: ['source-lens-config', 'approve-inclusion'] },
   plan: { required: ['bundle', 'platform', 'target-agent'], optional: ['overlay', 'lens-config'] },
+  apply: { required: ['bundle', 'platform', 'target-agent', 'state-dir'], optional: ['overlay', 'lens-config', 'approve-activation'] },
+  rollback: { required: ['state-dir', 'target-agent', 'tx'], optional: ['lens-config'] },
+  recover: { required: ['state-dir', 'target-agent'], optional: ['lens-config', 'tx', 'expect', 'action'], flags: ['inspect', 'resolve'] },
 };
 
 function parseArgs(command: string, args: string[]): Map<string, string> {
   const spec = SPECS[command];
   const out = new Map<string, string>();
-  for (let i = 0; i < args.length; i += 2) {
+  for (let i = 0; i < args.length; i++) {
     const flag = args[i];
-    const value = args[i + 1];
-    if (!flag.startsWith('--') || value === undefined) throw invalid('usage');
+    if (!flag.startsWith('--')) throw invalid('usage');
     const name = flag.slice(2);
-    if (!spec.required.includes(name) && !spec.optional.includes(name)) throw invalid('usage');
     if (out.has(name)) throw invalid('usage');
+    if (spec.flags?.includes(name)) {
+      out.set(name, 'true');
+      continue;
+    }
+    if (!spec.required.includes(name) && !spec.optional.includes(name)) throw invalid('usage');
+    const value = args[++i];
+    if (value === undefined || value.startsWith('--')) throw invalid('usage');
     out.set(name, value);
   }
   for (const r of spec.required) if (!out.has(r)) throw invalid('usage');
@@ -68,7 +82,7 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
   const [command, ...rest] = argv;
   if (command === '--help' || command === 'help') return { code: 0, stdout: USAGE, stderr: '' };
   try {
-    if (command === undefined || !(command in SPECS)) throw invalid('usage');
+    if (command === undefined || !Object.hasOwn(SPECS, command)) throw invalid('usage');
     const a = parseArgs(command, rest);
     if (command === 'capture-review') {
       const r = captureReview({
@@ -94,16 +108,40 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
       });
       return { code: 0, stdout: json({ ok: true, command, ...r }), stderr: '' };
     }
-    const r = plan({
-      bundle: a.get('bundle') ?? '',
-      platform: platformArg(a.get('platform')),
-      targetAgent: a.get('target-agent') ?? '',
-      overlay: a.get('overlay'),
-      lensConfig: a.get('lens-config'),
-      env,
-      guard,
-    });
-    return { code: r.status === 'ready' ? 0 : 1, stdout: json({ ok: r.status === 'ready', command, ...r }), stderr: '' };
+    if (command === 'plan') {
+      const r = plan({
+        bundle: a.get('bundle') ?? '', platform: platformArg(a.get('platform')),
+        targetAgent: a.get('target-agent') ?? '', overlay: a.get('overlay'), lensConfig: a.get('lens-config'), env, guard,
+      });
+      return { code: r.status === 'ready' ? 0 : 1, stdout: json({ ok: r.status === 'ready', command, ...r }), stderr: '' };
+    }
+    if (command === 'apply') {
+      const r = restoreFromPlan({
+        bundle: a.get('bundle') ?? '', platform: platformArg(a.get('platform')),
+        targetAgent: a.get('target-agent') ?? '', stateDir: a.get('state-dir') ?? '',
+        approveActivation: a.get('approve-activation'), overlay: a.get('overlay'), lensConfig: a.get('lens-config'), env, guard,
+      });
+      return { code: 0, stdout: json({ ok: true, command, ...r }), stderr: '' };
+    }
+    if (command === 'recover') {
+      if (a.has('inspect') === a.has('resolve')) throw invalid('usage');
+      const mutation = ['tx', 'expect', 'action'];
+      if (a.has('inspect') && mutation.some((k) => a.has(k))) throw invalid('usage');
+      if (a.has('resolve') && mutation.some((k) => !a.has(k))) throw invalid('usage');
+    }
+    const state = a.get('state-dir') ?? '';
+    const context = { env, guard, expectedTargets: { agent: a.get('target-agent') ?? '', lens: a.get('lens-config') ?? null } };
+    if (command === 'rollback') {
+      const r = rollbackRestore(state, a.get('tx') ?? '', context);
+      return { code: 0, stdout: json({ ok: true, command, ...r }), stderr: '' };
+    }
+    if (a.has('inspect')) {
+      const r = inspectRestore(state, context);
+      const ok = ['applied', 'rolled-back', 'closed'].includes(r.class);
+      return { code: ok ? 0 : 1, stdout: json({ ok, command, ...r }), stderr: '' };
+    }
+    const r = resolveRestore(state, { tx: a.get('tx') ?? '', expect: a.get('expect') ?? '', action: a.get('action') ?? '' }, context);
+    return { code: 0, stdout: json({ ok: true, command, tx: r.tx, action: r.action, previousClass: r.class, removed: r.removed }), stderr: '' };
   } catch (e) {
     if (e instanceof ToolError) {
       const body: Record<string, unknown> = { ok: false, error: e.code };

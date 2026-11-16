@@ -87,37 +87,85 @@ export function overlaps(a: string, b: string): boolean {
 
 /**
  * Programmatic guard context. Production callers (the CLI) never set it, so
- * the guard uses the account home from `os.userInfo()` (never `$HOME`).
+ * the guard always retains the account home from `os.userInfo()` and adds
+ * protection for environment-selected home roots separately.
  * In-process tests may supply a temporary fixture home so the guard's own
  * canonicalization touches only fixture paths. It is not reachable from the
  * command line or the environment, and it narrows nothing else: the guard
- * still canonicalizes the given locations and `PI_CODING_AGENT_DIR`.
+ * still protects the account home, environment HOME and `PI_CODING_AGENT_DIR`.
  */
 export interface GuardContext {
   home: string;
 }
 
+/** Resolve missing protected roots through a provable existing ancestor, not a guessed alias. */
+function canonicalLiveLocation(p: string): string {
+  let current = p;
+  const missing: string[] = [];
+  for (;;) {
+    let real: string;
+    try {
+      real = fs.realpathSync.native(current);
+    } catch (e) {
+      if (errCode(e) !== 'ENOENT') throw failure('live-location-unavailable');
+      let absent = false;
+      try {
+        fs.lstatSync(current);
+      } catch (entryError) {
+        if (errCode(entryError) !== 'ENOENT') throw failure('live-location-unavailable');
+        absent = true;
+      }
+      // A dangling link is an existing entry, not a missing directory.
+      if (!absent) throw failure('live-location-unavailable');
+      const parent = path.dirname(current);
+      if (parent === current) throw failure('live-location-unavailable');
+      missing.unshift(path.basename(current));
+      current = parent;
+      continue;
+    }
+    if (missing.length > 0) {
+      try {
+        if (!fs.lstatSync(real).isDirectory()) throw failure('live-location-unavailable');
+      } catch {
+        throw failure('live-location-unavailable');
+      }
+    }
+    return path.join(real, ...missing);
+  }
+}
+
 /**
  * Live Pi locations the initial fixture-only slice must never read from or
- * write to: `<home>/.pi`, `<home>/.pi-lens` and `$PI_CODING_AGENT_DIR`, each
+ * write to: account-home and environment-HOME `.pi`/`.pi-lens` roots plus
+ * `$PI_CODING_AGENT_DIR`, each
  * lexically and, when it exists, canonicalized with realpath so aliases are
  * refused too. The realpath calls query path metadata of these locations
  * (existence and symlink targets); they never open or read their contents.
+ * Unexpected lookup failures and ambiguous configured roots fail closed;
+ * missing roots retain both lexical and resolved-ancestor protection.
  */
 export function liveLocations(env: Record<string, string | undefined>, ctx?: GuardContext): string[] {
   const home = ctx === undefined ? os.userInfo().homedir : ctx.home;
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw failure('home-unavailable');
-  const out = [path.join(home, '.pi'), path.join(home, '.pi-lens')];
-  const agentDir = env.PI_CODING_AGENT_DIR;
-  if (typeof agentDir === 'string' && path.isAbsolute(agentDir)) out.push(path.resolve(agentDir));
-  const canonical: string[] = [];
-  for (const p of out) {
-    try {
-      canonical.push(fs.realpathSync.native(p));
-    } catch {
-      // Absent locations still guard their lexical path.
+  const homes = [home];
+  const environmentHome = env.HOME;
+  if (environmentHome !== undefined) {
+    if (typeof environmentHome !== 'string' || environmentHome.length === 0 || environmentHome.length > 4096 || environmentHome.includes('\0') || !path.isAbsolute(environmentHome)) {
+      throw failure('live-location-unavailable');
     }
+    homes.push(environmentHome);
   }
+  // HOME may redirect Pi, but it must never replace protection of the account home.
+  const out = [...new Set(homes.flatMap((h) => [path.join(h, '.pi'), path.join(h, '.pi-lens')]))];
+  const agentDir = env.PI_CODING_AGENT_DIR;
+  if (agentDir !== undefined && agentDir !== '') {
+    if (typeof agentDir !== 'string' || agentDir.length > 4096 || agentDir.includes('\0') || !path.isAbsolute(agentDir)) {
+      throw failure('live-location-unavailable');
+    }
+    out.push(path.resolve(agentDir));
+  }
+  const canonical: string[] = [];
+  for (const p of out) canonical.push(canonicalLiveLocation(p));
   return [...out, ...canonical];
 }
 

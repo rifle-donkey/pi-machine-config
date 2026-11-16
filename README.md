@@ -7,6 +7,8 @@ A private project for portable Pi configuration across macOS and Linux.
 - [Status](#status)
 - [Safety rules](#safety-rules)
 - [Capture a bundle and plan a new-target restore](#capture-a-bundle-and-plan-a-new-target-restore)
+- [Apply a fixture restore](#apply-a-fixture-restore)
+- [Inspect, roll back and recover](#inspect-roll-back-and-recover)
 - [Reference](#reference)
   - [Commands](#commands)
   - [Output and exit status](#output-and-exit-status)
@@ -19,9 +21,9 @@ A private project for portable Pi configuration across macOS and Linux.
 
 ## Status
 
-Three commands are available: `capture-review` reads the sources an inclusion policy lists and prints a capture-review token without writing anything, `capture` builds a bundle once you approve that exact token, and `plan` checks a bundle against a new, absent target and prints a read-only plan. Nothing writes a Pi agent directory yet: apply, package restore, doctor, rollback and recovery are not available. The [implementation plan](docs/plans/portable-config.md) defines the remaining behavior.
+Six fixture-only commands are available: `capture-review`, `capture`, `plan`, `apply`, `rollback` and `recover`. Capture and activation each require their own matching review token. Apply creates a new target from a complete ready plan; rollback and recovery act only on proven owned configuration. Package installation, full resource discovery and real-machine operation remain unavailable. The [implementation plan](docs/plans/portable-config.md) defines the remaining behavior.
 
-Every command refuses any path that overlaps `~/.pi`, `~/.pi-lens` or `$PI_CODING_AGENT_DIR` (the home directory comes from the account database, not `$HOME`), so this release works only with fixture directories, not with a live Pi installation. To also catch symlinked aliases of those locations, each command resolves their real paths. That queries path metadata (whether they exist and where symlinks point); it never opens or reads anything inside them.
+Every command protects `.pi` and `.pi-lens` under both the account-database home and any absolute `$HOME` selected by Pi, plus `$PI_CODING_AGENT_DIR`. Changing `$HOME` never removes account-home protection. This release therefore works only with fixture directories, not with a live Pi installation. To also catch symlinked aliases of those locations, each command resolves their real paths. That queries path metadata (whether they exist and where symlinks point); it never opens or reads anything inside them.
 
 The commands run directly from a checkout with Node's built-in TypeScript support and have no dependencies. They are tested with Node 26; the intended Node 24 baseline is not yet verified.
 
@@ -47,6 +49,36 @@ Development instructions and document ownership: [AGENTS.md](AGENTS.md).
 5. Optionally write a machine overlay for local-only files and package removals ([Machine overlay](#machine-overlay)).
 6. Run `plan` for the target platform and a target agent path that does not exist yet. Review the classifications. Only a `ready` plan prints an approval token; `incomplete` and `conflict` plans print none.
 
+## Apply a fixture restore
+
+1. Complete the capture and plan procedure above. Keep Pi and editors stopped; the tool cannot prove that no Pi process is running.
+2. Review the exact ready plan and its `approvalToken`. Applying configuration is activation: package declarations can download code and run install scripts on the next Pi start or reload, even though apply itself invokes no Pi or network operation. Local instructions and resources can also load at startup. Do not start Pi until apply reports success.
+3. Choose an absent absolute state-directory path whose parent exists, outside the checkout, bundle, overlay, agent and lens targets. Existing targets and state directories are refused, even empty or identical ones.
+4. Run `apply` from the command reference with the same bundle, platform, overlay and targets, plus the state path and exact `--approve-activation` token. It recompiles under the state lock before the first journal or target write. A changed intent refuses without target writes. A late refusal may retain a private empty state directory; it is not automatically deleted or reused.
+5. Save the returned transaction ID and state path. Never commit runtime state. Backups, journals and lock metadata can be private. No automatic package installation runs during this command.
+
+Only a `ready` plan can activate. Incomplete schema, dependency or resource checks still block application. This does not make unimplemented adapters available or authorize a real restore.
+
+## Inspect, roll back and recover
+
+1. Use `recover --inspect` with the original state path, `--target-agent` and, when present, `--lens-config`. The target context must match the private journal before any target access. Inspection is read-only and never breaks locks.
+2. To undo owned unchanged configuration, run `rollback` with the same context and exact `--tx`. The whole dependency group is preflighted; changed or replaced output refuses cleanup. Directories, package installations, runtime files and unknown files remain. Repetition never removes a later replacement.
+3. After an interruption, inspect first. Use `recover --resolve` only with the reported transaction ID, exact current `--expect` class and an offered `--action`. A stale classification refuses rather than retrying automatically. A successful resolution reports `previousClass`; inspect again for the current state.
+4. Locks require proven stale ownership; no force or automatic breaking exists. Missing boot identity, a live or unprovable owner, corrupt state or unknown identity requires stopping and separately reviewed manual recovery. Do not edit a journal or blindly delete locks/state. `PI_OFFLINE=1` stops missing-package auto-installation, not execution of already installed extensions.
+
+| Inspection class | Offered action or next step |
+|---|---|
+| `gate-stale`, `lock-stale` | `release-gate`, `release-lock` respectively; exact stale proof is rechecked |
+| `unfinished` | `abandon`; foreign destinations and unproven orphan stages remain |
+| `published-unfinished` | `finalize`, then inspect and request rollback if desired |
+| `unfinalized` | `finalize` |
+| `applied`, `partial`, `rollback-pending` | `rollback` |
+| `conflict` | `record-conflict` preserves unproven outputs; it does not repair them |
+| `rolled-back`, `closed`, `preserved` | Terminal history; no automatic cleanup of replacements |
+| `corrupt`, held or unprovable locks | No automated action; retain evidence and stop |
+
+Moving target parents can make even terminal inspection refuse. Rollback retains the agent directory, so applying again to the same path requires a separately approved removal or a new target. A failed lock release can retain its intent and consume a bounded recovery slot. No power-loss or hostile same-user pathname-race guarantee is claimed.
+
 ## Reference
 
 ### Commands
@@ -57,6 +89,10 @@ Run from the repository root. All paths must be absolute.
 node src/cli.ts capture-review --policy <file> --source-agent <dir> --platform <darwin|linux> [--source-lens-config <file>]
 node src/cli.ts capture --policy <file> --source-agent <dir> --platform <darwin|linux> --out <new-dir> --approve-inclusion <token> [--source-lens-config <file>]
 node src/cli.ts plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
+node src/cli.ts apply --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> --state-dir <new-dir> --approve-activation <token> [--overlay <dir>] [--lens-config <new-file>]
+node src/cli.ts rollback --state-dir <dir> --target-agent <dir> --tx <id> [--lens-config <file>]
+node src/cli.ts recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
+node src/cli.ts recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
 ```
 
 `capture-review` and `capture` options:
@@ -80,24 +116,31 @@ node src/cli.ts plan --bundle <dir> --platform <darwin|linux> --target-agent <ne
 | `--overlay` | Optional machine overlay directory. |
 | `--lens-config` | New lens configuration file. Required exactly when the merged intent contains the `lens-config` file. |
 
+`apply` uses the `plan` options plus required `--state-dir` and `--approve-activation`. Its platform must match the running host. `rollback` and both `recover` modes require the original `--state-dir` and `--target-agent`; a restored lens target also requires its matching `--lens-config`. `--inspect` and `--resolve` are mutually exclusive presence flags, not values. Only resolve accepts `--tx`, `--expect` and `--action`, and requires all three. Internal guard, dependency and fault options are never accepted.
+
 Supplied paths may have symlinked ancestors; the supplied path itself must not be a symlink. The bundle, overlay, agent target and lens target must not contain one another; `capture` likewise keeps its output apart from its inputs.
 
 ### Output and exit status
 
 | Exit | Meaning | Output |
 |---|---|---|
-| `0` | Success: capture completed, or the plan is `ready` | JSON on stdout |
-| `1` | Conflict or operational failure, including `incomplete` and `conflict` plans | Plan JSON on stdout, or an error on stderr |
+| `0` | Success: review/capture, ready plan, completed mutation, or inspection of `applied`, `rolled-back` or `closed` history | JSON on stdout |
+| `1` | Conflict or operational failure, incomplete plan, or inspection requiring recovery/manual attention | Plan/inspection JSON on stdout, or an error on stderr |
 | `2` | Invalid input or invocation | Error on stderr |
 
-Errors are `{"ok":false,"error":"<code>"}`, sometimes with a `layer` field. Output never contains configuration values, rejected input, paths, file contents or subprocess output. `capture-review` and a successful `capture` report per-layer counts and how many unlisted settings keys and supported packages were skipped; `capture-review` also prints `captureReviewToken`.
+Errors are `{"ok":false,"error":"<code>"}`, sometimes with a `layer` field. Output contains approved relative item paths and transaction IDs, never configuration values, rejected input, absolute paths, file contents or subprocess output. `capture-review` and a successful `capture` report per-layer counts and how many unlisted settings keys and supported packages were skipped; `capture-review` also prints `captureReviewToken`.
 
 Codes you may need to act on:
 
 | Code | Exit | Meaning |
 |---|---|---|
+| `live-location-unavailable` | `1` | A protected root cannot be safely resolved, a defined `HOME` is not a nonempty absolute path, or a nonempty `PI_CODING_AGENT_DIR` is not a valid absolute path. Check the configured directory and metadata access before retrying; the tool does not change permissions. Missing roots remain protected through both their supplied path and resolved existing ancestors; dangling or unresolvable aliases are refused. |
 | `inclusion-approval-required` | `2` | `capture` was run without `--approve-inclusion`. |
 | `approval-token-invalid` | `2` | The supplied token is not `sha256:<64 lowercase hex>`. |
+| `activation-approval-required` | `2` | Apply requires the explicit reviewed plan token. |
+| `activation-approval-mismatch`, `plan-not-ready` | `1` | The current complete ready intent no longer matches the activation token, or the plan cannot activate. No target configuration is created. |
+| `target-context-mismatch` | `1` | The target flags do not match the transaction; target access is refused. |
+| `tx-mismatch`, `expect-mismatch`, `rollback-conflict` | `1` | Transaction, observed class or owned output changed; inspect before another explicit action. |
 | `inclusion-approval-mismatch` | `1` | The inputs no longer match the reviewed token; nothing was created. |
 | `inclusion-approval-missing`, `inclusion-approval-digest-mismatch`, `inclusion-approval-invalid`, `inclusion-approval-bundle-mismatch` | `2` | The bundle's approval record is absent, altered, inconsistent, or does not describe this bundle. |
 | `output-exists`, `output-alias-exists`, `output-parent-missing` | `1` | The capture output exists, has a case or normalization alias in its parent, or has no parent. |
@@ -186,7 +229,7 @@ Whatever the class, these paths are refused with `path-prohibited` while the pol
 
 The only exceptions are the exact destinations in the table above: `AGENTS.md` as `agent-context`, `keybindings.json`, `dev-kit/models.json` and the overlay `sandbox.json` as `tool-config`.
 
-`template: true` is allowed only for `agent-context`, `tool-config` and `external-config`. A template may contain only the exact tokens `{{HOME}}` and `{{AGENT_DIR}}`: any other `{{`, `}}` (unknown, unclosed, nested or brace-adjacent tokens) is refused. In JSON payloads the rule applies inside every string, and a token may appear only there. After rendering, no `{{` or `}}` may remain. `plan` substitutes the target user's home directory and the canonical target agent path in memory, escaping them in JSON. Nothing is shell-expanded.
+`template: true` is allowed only for `agent-context`, `tool-config` and `external-config`. A template may contain only the exact tokens `{{HOME}}` and `{{AGENT_DIR}}`: any other `{{`, `}}` (unknown, unclosed, nested or brace-adjacent tokens) is refused. In JSON payloads the rule applies inside every string, and a token may appear only there. After rendering, no `{{` or `}}` may remain. `plan` substitutes the target account-database home directory and the canonical target agent path in memory, escaping them in JSON. Nothing is shell-expanded.
 
 `expect.frontmatter` maps keys to required `true`, `false` or string values. The frontmatter reader is deliberately narrow: top-level `key: value` lines, with block or nested values allowed only for keys that are not checked. Any other syntax makes the file unsupported.
 

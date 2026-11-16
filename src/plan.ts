@@ -42,6 +42,7 @@ import {
   sha256Hex,
   type FileClass,
   type FileRoot,
+  type PackageDecl,
   type Platform,
 } from './schema.ts';
 
@@ -72,6 +73,25 @@ export interface PlanResult {
   overlay: boolean;
   items: PlanItem[];
   approvalToken: string | null;
+}
+
+/** Private rendered bytes for restore integration; never serialize this as CLI output. */
+export interface PreparedFile {
+  root: FileRoot;
+  path: string;
+  class: FileClass;
+  bytes: Uint8Array;
+  sha256: string;
+}
+
+/** Compilation is not authorization: callers must require ready and match the token. */
+export interface PreparedPlan {
+  result: PlanResult;
+  settings: JsonObject;
+  packages: PackageDecl[];
+  files: PreparedFile[];
+  targets: { agent: string; lensConfig: string | null };
+  protectedRoots: string[];
 }
 
 /**
@@ -112,7 +132,7 @@ function revalidate(merged: Merged): void {
   for (const f of merged.files) checkContent(f.record, f.bytes);
 }
 
-export function plan(opts: PlanOptions): PlanResult {
+export function preparePlan(opts: PlanOptions): PreparedPlan {
   const live = liveLocations(opts.env ?? process.env, opts.guard);
   const bundleArg = requireAbsolute(opts.bundle, 'usage');
   const agentArg = requireAbsolute(opts.targetAgent, 'usage');
@@ -159,6 +179,7 @@ export function plan(opts: PlanOptions): PlanResult {
 
   const home = os.userInfo().homedir;
   const rendered: RenderedFile[] = [];
+  const files: PreparedFile[] = [];
   for (const { record, bytes } of merged.files) {
     const text = new TextDecoder().decode(bytes);
     const out = record.template ? renderTemplate(record.class, text, { HOME: home, AGENT_DIR: agent.path }) : bytes;
@@ -167,7 +188,9 @@ export function plan(opts: PlanOptions): PlanResult {
     if (record.root === 'agent') target = path.join(agent.path, ...record.path.split('/'));
     else if (lens) target = lens.path;
     else throw invalid('lens-config-required');
-    rendered.push({ root: record.root, path: record.path, class: record.class, template: record.template, target, sha256: sha256Hex(out) });
+    const sha256 = sha256Hex(out);
+    rendered.push({ root: record.root, path: record.path, class: record.class, template: record.template, target, sha256 });
+    files.push({ root: record.root, path: record.path, class: record.class, bytes: Buffer.from(out), sha256 });
     const reason = INCOMPLETE_CLASSES.get(record.class);
     const base = { kind: 'file' as const, root: record.root, path: record.path, class: record.class };
     if (reason) items.push({ ...base, operation: 'incomplete', reason });
@@ -200,7 +223,19 @@ export function plan(opts: PlanOptions): PlanResult {
     });
     approvalToken = planToken(doc);
   }
-  return { status, platform: opts.platform, overlay: overlay !== undefined, items, approvalToken };
+  return {
+    result: { status, platform: opts.platform, overlay: overlay !== undefined, items, approvalToken },
+    settings: merged.settings,
+    packages: merged.packages,
+    files,
+    targets: { agent: agent.path, lensConfig: lens ? lens.path : null },
+    protectedRoots: [bundleRoot.path, ...(overlayRoot ? [overlayRoot.path] : [])],
+  };
+}
+
+/** Public read-only result: rendered payloads and settings are deliberately omitted. */
+export function plan(opts: PlanOptions): PlanResult {
+  return preparePlan(opts).result;
 }
 
 interface TokenInput {

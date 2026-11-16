@@ -1165,10 +1165,10 @@ describe('locks and stale-owner proof', () => {
   });
 });
 
-describe('no public write command', () => {
-  it('keeps apply, rollback and recovery out of the CLI', () => {
+describe('public write command admission', () => {
+  it('refuses incomplete write-command invocations', () => {
     for (const c of ['apply', 'rollback', 'recover']) {
-      assert.ok(!USAGE.includes(c), c);
+      assert.ok(USAGE.includes(c), c);
       assert.equal(main([c, '--tx', 'x'], {}, GUARD).code, 2);
     }
   });

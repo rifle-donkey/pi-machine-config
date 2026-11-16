@@ -1,7 +1,8 @@
 /**
- * Internal fresh-restore filesystem transaction engine (implementation
- * slice 2a). It is not a command: no CLI entry point reaches it yet, and it
- * does not implement the activation consent gate.
+ * Fresh-restore filesystem transaction engine. The apply command reaches it
+ * only through restoreFromPlan's ready-plan and locked-token gate. The raw
+ * packet API remains a trusted-caller interface, not an authorization boundary.
+ * State commands supply expectedTargets to bind the journal before target access.
  *
  * Caller contract (later CLI integration): build a `RestorePacket` only from
  * a complete, verified bundle and plan whose status is `ready`, after the
@@ -19,7 +20,8 @@
  * 1. Validate the complete packet and the worst-case size of every journal
  *    this transaction can ever write (<= 1 MiB) before any filesystem write.
  * 2. Exclusively create the private state directory (0700), sync its parent,
- *    exclusively create the state lock, write the first journal.
+ *    exclusively create the state lock, run any trusted locked-intent verifier,
+ *    then write the first journal. A verifier mismatch creates no target output.
  * 3. Under the lock, recheck absent targets; journal root intent; exclusively
  *    mkdir the agent root (EEXIST is `not-created`, never ownership); sync its
  *    parent; journal the root identity. Create the reserved target lock
@@ -183,12 +185,21 @@ export interface RestorePacket {
   protectedRoots: string[];
 }
 
+export interface RestoreTargets {
+  agent: string;
+  lens: string | null;
+}
+
 export interface TxOptions {
   env?: Record<string, string | undefined>;
   /** Internal test seam for the live-path guard; see `GuardContext`. */
   guard?: GuardContext;
   /** Internal test seam for OS probes and fault injection; never set by a command. */
   deps?: Partial<TxDeps>;
+  /** Trusted integration verifier: recompute the plan token under the state lock, before journal/target writes. */
+  verifyLockedIntent?: () => string;
+  /** Existing-transaction context supplied by the CLI; checked before any target access. */
+  expectedTargets?: RestoreTargets;
 }
 
 export interface ApplyResult {
@@ -945,6 +956,9 @@ export function applyRestore(packet: RestorePacket, opts: TxOptions = {}): Apply
   ctx.lockId = fileId(lockSt);
   try {
     syncDir(deps, 'lock-dirsync', 'lock-failed', state.path);
+    if (opts.verifyLockedIntent !== undefined && opts.verifyLockedIntent() !== j.planToken) {
+      throw failure('activation-approval-mismatch');
+    }
     save(ctx);
     // Under the lock: the targets and their parents are still as validated.
     requireAbsent(absentTarget(agent.path), 'target');
@@ -1222,7 +1236,7 @@ function corruptAnalysis(stateDir: string, reason: string): Analysis {
  * Read-only analysis of a state directory. `ownLock`/`ownGate` let the
  * process that currently holds the writer lock or recovery gate ignore it.
  */
-function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId } = {}): Analysis {
+function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId } = {}, expected?: RestoreTargets): Analysis {
   const uid = deps.uid();
   const dst = lstatQuiet(stateDir);
   if (dst === null || dst === 'error' || !dst.isDirectory() || Number(dst.uid) !== uid || (dst.mode & 0o077n) !== 0n) {
@@ -1261,6 +1275,9 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
     return corruptAnalysis(stateDir, 'journal-invalid');
   }
   guardPaths([j.targets.agent, j.targets.lens], live);
+  if (expected !== undefined && (expected.agent !== j.targets.agent || expected.lens !== j.targets.lens)) {
+    throw failure('target-context-mismatch');
+  }
   guardRecoveryTargets(j, live);
 
   let boot: string | null | undefined;
@@ -1342,20 +1359,35 @@ function inspectResult(a: Analysis, warnings: string[]): InspectResult {
   };
 }
 
-function openState(state: string, opts: TxOptions): { deps: TxDeps; live: string[]; dir: string } {
+function bindTargets(value: RestoreTargets | undefined, live: string[]): RestoreTargets | undefined {
+  if (value === undefined) return undefined;
+  if (!isObject(value as unknown) || Object.keys(value).length !== 2 || typeof value.agent !== 'string' || (value.lens !== null && typeof value.lens !== 'string')) {
+    throw invalid('target-context-invalid');
+  }
+  const agentArg = requireAbsolute(value.agent, 'usage');
+  const lensArg = value.lens === null ? null : requireAbsolute(value.lens, 'usage');
+  guardPaths([agentArg, lensArg], live);
+  const agent = absentTarget(agentArg).path;
+  const lens = lensArg === null ? null : absentTarget(lensArg).path;
+  guardPaths([agent, lens], live);
+  return { agent, lens };
+}
+
+function openState(state: string, opts: TxOptions): { deps: TxDeps; live: string[]; dir: string; expected: RestoreTargets | undefined } {
   const deps = resolveDeps(opts.deps);
   const live = liveLocations(opts.env ?? process.env, opts.guard);
+  const expected = bindTargets(opts.expectedTargets, live);
   const arg = requireAbsolute(state, 'usage');
   guardLiveLexical(arg, live);
   const root = existingDir(arg, 'state-missing');
   guardLiveLexical(root.path, live);
-  return { deps, live, dir: root.path };
+  return { deps, live, dir: root.path, expected };
 }
 
 /** Read-only classification of one transaction; never breaks locks or changes files. */
 export function inspectRestore(state: string, opts: TxOptions = {}): InspectResult {
-  const { deps, live, dir } = openState(state, opts);
-  const a = analyze(dir, deps, live);
+  const { deps, live, dir, expected } = openState(state, opts);
+  const a = analyze(dir, deps, live, {}, expected);
   const locksPresent = [a.gate, a.stateLock, a.targetLock].some((l) => l.record !== null);
   const warnings = locksPresent && bootIdOf(deps) === null ? ['boot-identity-unavailable'] : [];
   return inspectResult(a, warnings);
@@ -1378,11 +1410,11 @@ function acquireWriter(dir: string, deps: TxDeps, tx: string): FileId {
 }
 
 /** Run `fn` under the writer lock against a fresh analysis that must still match `want`. */
-function underWriter<T>(dir: string, deps: TxDeps, live: string[], tx: string, fn: (a: Analysis, ctx: Ctx) => T): T {
+function underWriter<T>(dir: string, deps: TxDeps, live: string[], tx: string, fn: (a: Analysis, ctx: Ctx) => T, expected?: RestoreTargets): T {
   const id = acquireWriter(dir, deps, tx);
   let out: T;
   try {
-    const a = analyze(dir, deps, live, { lock: id });
+    const a = analyze(dir, deps, live, { lock: id }, expected);
     if (a.j === null) throw failure('state-corrupt');
     if (a.j.tx !== tx) throw failure('tx-mismatch');
     out = fn(a, { deps, stateDir: dir, j: a.j });
@@ -1511,9 +1543,9 @@ const ROLLBACK_CLASSES: ReadonlySet<TxClass> = new Set(['applied', 'partial', 'r
  * runtime files stay. Repeating it after completion removes nothing.
  */
 export function rollbackRestore(state: string, tx: string, opts: TxOptions = {}): RollbackResult {
-  const { deps, live, dir } = openState(state, opts);
+  const { deps, live, dir, expected } = openState(state, opts);
   if (typeof tx !== 'string' || !TX_RE.test(tx)) throw invalid('tx-invalid');
-  const pre = analyze(dir, deps, live);
+  const pre = analyze(dir, deps, live, {}, expected);
   if (pre.j === null) throw failure('state-corrupt');
   if (pre.j.tx !== tx) throw failure('tx-mismatch');
   if (pre.cls === 'rolled-back') return { tx, status: 'rolled-back', removed: 0 };
@@ -1525,12 +1557,12 @@ export function rollbackRestore(state: string, tx: string, opts: TxOptions = {})
     if (a.cls === 'conflict') throw failure('rollback-conflict');
     if (!ROLLBACK_CLASSES.has(a.cls)) throw failure('rollback-unavailable');
     return doRollback(ctx, a);
-  });
+  }, expected);
   return { tx, status: 'rolled-back', removed };
 }
 
-function releaseGate(dir: string, deps: TxDeps, live: string[]): number {
-  const a = analyze(dir, deps, live);
+function releaseGate(dir: string, deps: TxDeps, live: string[], expected?: RestoreTargets): number {
+  const a = analyze(dir, deps, live, {}, expected);
   if (a.cls !== 'gate-stale' || a.gate.id === null) throw failure('expect-mismatch');
   const gid = a.gate.id;
   const r = unlinkProven(deps, 'stale-unlink', 'lock-release-failed', a.gate.file, (st) => sameFile(st, gid));
@@ -1539,7 +1571,7 @@ function releaseGate(dir: string, deps: TxDeps, live: string[]): number {
   return 1;
 }
 
-function releaseLocks(dir: string, deps: TxDeps, live: string[], tx: string): number {
+function releaseLocks(dir: string, deps: TxDeps, live: string[], tx: string, expected?: RestoreTargets): number {
   const gateFile = path.join(dir, GATE_NAME);
   const gst = createExclusive(deps, 'gate-create', 'gate-failed', gateFile, lockBytes(makeLock(deps, 'gate', tx, bootIdOf(deps))));
   if (gst === 'exists') throw failure('gate-held');
@@ -1547,7 +1579,7 @@ function releaseLocks(dir: string, deps: TxDeps, live: string[], tx: string): nu
   let removed = 0;
   try {
     syncDir(deps, 'gate-dirsync', 'gate-failed', dir);
-    const a = analyze(dir, deps, live, { gate: gid });
+    const a = analyze(dir, deps, live, { gate: gid }, expected);
     if (a.j === null) throw failure('state-corrupt');
     if (a.cls !== 'lock-stale') throw failure('expect-mismatch');
     if (a.j.resolutions.length >= MAX_RESOLUTIONS) throw failure('resolution-limit');
@@ -1579,21 +1611,21 @@ function releaseLocks(dir: string, deps: TxDeps, live: string[], tx: string): nu
  * runs under the writer lock against a fresh classification.
  */
 export function resolveRestore(state: string, req: ResolveRequest, opts: TxOptions = {}): ResolveResult {
-  const { deps, live, dir } = openState(state, opts);
+  const { deps, live, dir, expected } = openState(state, opts);
   if (!isObject(req as unknown) || typeof req.tx !== 'string' || !TX_RE.test(req.tx)) throw invalid('tx-invalid');
   if (!(TX_CLASSES as readonly string[]).includes(req.expect)) throw invalid('expect-invalid');
   if (!(TX_ACTIONS as readonly string[]).includes(req.action)) throw invalid('action-invalid');
   const expect = req.expect as TxClass;
   const action = req.action as TxAction;
-  const pre = analyze(dir, deps, live);
+  const pre = analyze(dir, deps, live, {}, expected);
   if (pre.j === null) throw failure('state-corrupt');
   if (pre.j.tx !== req.tx) throw failure('tx-mismatch');
   if (pre.cls !== expect) throw failure('expect-mismatch');
   if (!pre.actions.includes(action)) throw invalid('action-not-allowed');
   const tx = req.tx;
   let removed: number;
-  if (action === 'release-gate') removed = releaseGate(dir, deps, live);
-  else if (action === 'release-lock') removed = releaseLocks(dir, deps, live, tx);
+  if (action === 'release-gate') removed = releaseGate(dir, deps, live, expected);
+  else if (action === 'release-lock') removed = releaseLocks(dir, deps, live, tx, expected);
   else {
     removed = underWriter(dir, deps, live, tx, (a, ctx) => {
       if (a.cls !== expect) throw failure('expect-mismatch');
@@ -1610,7 +1642,7 @@ export function resolveRestore(state: string, req: ResolveRequest, opts: TxOptio
         default:
           return doRecordConflict(ctx, a);
       }
-    });
+    }, expected);
   }
   return { tx, action, class: expect, removed };
 }

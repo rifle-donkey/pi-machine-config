@@ -30,10 +30,12 @@ GitHub account: rifle-donkey
 - Read every input file through `readUnder`/`readFileRoot` in `src/fsafe.ts` after canonicalizing its root with `existingDir`/`existingFile`/`absentTarget`; apply `guardLiveLexical` to the raw argument before any filesystem access and again to the canonical path.
 - Errors are `ToolError` codes from `src/errors.ts`: `invalid` exits 2, `failure` exits 1. Never put input text, paths or exception text in a code; README "Output and exit status" documents the codes users see.
 - `tokenDocument` in `src/plan.ts` defines the plan-token coverage listed in README "Plan classifications and approval token"; change both together and keep the token domain string versioned.
+- `preparePlan` returns private rendered bytes and values; serialize only `plan(...)` or `preparePlan(...).result`, never the prepared object. `plan` itself returns only `PreparedPlan.result`.
+- `restoreFromPlan` in `src/restore.ts` requires a ready plan and matching consent, and installs the trusted `verifyLockedIntent` verifier to recompile under the state lock before the first journal or target write. The apply command uses this service; never wire the raw engine directly to CLI input.
 - `reviewDescriptor` and `CAPTURE_TOKEN_DOMAIN` in `src/approval.ts` define recorded capture consent; change them together with README "Capture review and inclusion approval" and keep the token domain versioned.
 - Destination classes, settings types and package rules live only in `src/schema.ts`; README "Inclusion policy" mirrors them.
 - Classes or settings that need an adapter not built yet must be classified `incomplete` in `src/plan.ts` (`INCOMPLETE_CLASSES`), never silently accepted or dropped.
-- `src/transaction.ts` is the internal restore engine; no command calls it yet. Its module docstring states the caller contract (packet only from a `ready` plan with a matched activation token). Its `deps` option (OS probes, `fault` hook) is a test seam like `GuardContext`: never expose it through a command-line option or environment variable. Its reserved stage and lock names depend on `relPath` in `src/schema.ts` refusing dot-prefixed components.
+- `src/transaction.ts` is the filesystem engine behind the restore service. CLI state operations must supply `expectedTargets` for inspect, rollback and resolve; it is compared with the journal before target access and again under writer/recovery locks. Its module docstring states the caller contract (packet only from a `ready` plan with a matched activation token). Its `deps` option (OS probes, `fault` hook) is a test seam like `GuardContext`: never expose it through a command-line option or environment variable. Its reserved stage and lock names depend on `relPath` in `src/schema.ts` refusing dot-prefixed components.
 
 ## Development rules
 
@@ -41,7 +43,7 @@ GitHub account: rifle-donkey
 - Use the reinforced dev-flow workflow: independent design/security review before behavioral implementation, separate implementation review, independently authored QA.
 - Use TypeScript, Node built-ins, and no runtime dependencies for the initial offline slice. Node 24 or newer is the intended execution baseline; verify available capabilities before claiming support.
 - Keep tests isolated in temporary fixture homes. Never load live extensions or run Pi during tests.
-- In-process tests pass a fixture-home `GuardContext` (`src/fsafe.ts`) to `main`, `capture`, `captureReview` or `plan`, so the live-path guard resolves only fixture paths. Never add a command-line option or environment variable that replaces or disables the guard; spawned CLI tests use the production guard, which queries only path metadata of the real locations.
+- In-process tests pass a fixture-home `GuardContext` (`src/fsafe.ts`) and an explicit fixture environment (normally `{}`) to `main`, `capture`, `captureReview` or `plan`, so the live-path guard does not inherit actual `HOME` or `PI_CODING_AGENT_DIR` locations. Never add a command-line option or environment variable that replaces or disables the guard; spawned CLI tests use the production guard, which queries only path metadata of the real locations.
 - Commit and push only the snapshot and destination explicitly authorized by the user; do not generalize that permission to later delivery.
 - Network package restoration, real target writes, sandbox expansion and authentication repair require separate authorization.
 - Check documentation impact through this map after every code change; use project-docs for affected documents.
