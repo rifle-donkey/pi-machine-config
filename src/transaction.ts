@@ -60,7 +60,22 @@
  * | `rollback-pending` | rollback interrupted | `rollback` |
  * | `conflict` | changed, missing or unproven output or root | `record-conflict` |
  * | `rolled-back`/`closed`/`preserved` | terminal | none |
- * | `corrupt` | unreadable, unsafe or inconsistent state | none (manual) |
+ * | `corrupt` | unreadable, unsafe or inconsistent state, or unresolved package attempt | none (manual) |
+ * Ordinary state operations treat `package-attempt.json` as metadata-only
+ * exclusion before journal/target reads or stale-lock probes. They never open
+ * or remove it. Recognizable package-kind locks and unresolved ledgers also
+ * exclude recovery without PID/boot stale release. Corrupt results have
+ * unobserved lock fields, not proof that locks are absent.
+ *
+ * `runPackageAttempts` is a trusted fixture-only async service. The production
+ * executor is null and refuses before filesystem access. Its unexported exact
+ * file identities authorize only its own analysis, never ordinary recovery.
+ * It persists an audit sequence before work/spawn and completion before gate
+ * removal. After non-lock writes start, failures retain surviving exclusion;
+ * only proven stop, unchanged configuration and durable cleanup permit normal
+ * lock release. Final lock-unlink/sync failure has the reviewed point-in-time
+ * completion exception. No CLI, executable approval or missing-only production
+ * selection is implemented. Diagnostic labels never authorize process cleanup.
  * Reason `journal-missing` means the failure preceded the first journal write,
  * so no target was created (root creation always follows a durable intent).
  * A `rollback-pending` transaction whose remaining outputs are absent is
@@ -85,11 +100,24 @@
  * target-lock-release(-sync), lock-release(-sync), rollback-unlink,
  * rollback-dirsync, abandon-unlink, abandon-dirsync, gate-create(-sync),
  * gate-dirsync, stale-unlink, stale-dirsync, gate-release(-sync).
+ * Package-only points: pkglock-create(-sync), pkglock-dirsync,
+ * work-root-mkdir, work-root-sync, ledger-write(-sync), ledger-rename,
+ * ledger-dirsync, work-mkdir, work-file(-sync), work-dirsync,
+ * attempt-create(-sync), attempt-dirsync, attempt-write(-sync),
+ * attempt-rename, attempt-rename-dirsync, attempt-unlink,
+ * attempt-unlink-dirsync, pkglock-release(-sync). Replacement points repeat
+ * for each phase; a pre-operation fault event is not successful durability.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isTokenSyntax } from './approval.ts';
+import { renderSettings } from './settings-output.ts';
+import {
+  ATTEMPT_KIND, LEDGER_KIND, LEDGER_LIMIT, MAX_ATTEMPTS, MAX_RUNS,
+  attemptBytes, checkAdvance, ledgerBytes, outcomeForExit, parseAttempt, parseLedger,
+  type AttemptRecord, type PackageLedger, type PackageOwner, type PackageExit,
+} from './package-attempt.ts';
 import { ToolError, failure, invalid } from './errors.ts';
 import {
   absentTarget,
@@ -130,6 +158,7 @@ import {
   guarded,
   judgeLock,
   linkNoReplace,
+  hostnameOf,
   lockBytes,
   lstatOrNull,
   makeLock,
@@ -138,6 +167,7 @@ import {
   parseLockRecord,
   readProven,
   replaceFile,
+  replacePrivate,
   resolveDeps,
   sameDir,
   sameFile,
@@ -281,6 +311,11 @@ export const JOURNAL_KIND = 'pi-machine-config/restore-journal';
 const JOURNAL_NAME = 'journal.json';
 const LOCK_NAME = 'lock.json';
 const GATE_NAME = 'recovery-gate.json';
+const ATTEMPT_NAME = 'package-attempt.json';
+const LEDGER_NAME = 'package-ledger.json';
+const WORK_NAME = 'package-work';
+const PACKAGE_LOCK_KIND = 'pi-machine-config/package-lock';
+const LEDGER_TMP_RE = /^package-ledger\.json\.tmp-[0-9a-f]{16}$/;
 const TMP_RE = /^journal\.json\.tmp-[0-9a-f]{16}$/;
 const TARGET_LOCK_NAME = '.pi-machine-config-lock';
 const STAGE_PREFIX = '.pi-machine-config-stage-';
@@ -688,16 +723,11 @@ function validatePacket(p: RestorePacket): ValidPacket {
     ids.add(packageIdentity(decl));
     packages.push(decl);
   }
-  if (Object.keys(settings).length > 0 || packages.length > 0) {
-    const doc = Object.create(null) as JsonObject;
-    for (const k of Object.keys(settings)) doc[k] = settings[k];
-    // SAFETY: validated declarations are JSON strings or plain objects.
-    if (packages.length > 0) doc.packages = packages as JsonValue[];
-    const bytes = Buffer.from(prettyJson(doc), 'utf8');
-    if (bytes.length > LIMITS.fileBytes) throw invalid('settings-too-large');
+  const settingsBytes = renderSettings(settings, packages);
+  if (settingsBytes !== null) {
     outputs.push({
-      entry: { root: 'agent', path: SETTINGS_PATH, class: 'settings', bytes: bytes.length, sha256: sha256Hex(bytes), phase: 'pending', stageId: null, targetId: null, note: null },
-      bytes,
+      entry: { root: 'agent', path: SETTINGS_PATH, class: 'settings', bytes: settingsBytes.length, sha256: sha256Hex(settingsBytes), phase: 'pending', stageId: null, targetId: null, note: null },
+      bytes: settingsBytes,
     });
   }
   if (outputs.length === 0) throw invalid('packet-empty');
@@ -750,6 +780,11 @@ function lstatQuiet(p: string): fs.BigIntStats | null | 'error' {
   } catch {
     return 'error';
   }
+}
+
+/** Unknown attempt state is exclusion, never permission to inspect or signal its owner. */
+function requireNoPackageAttempt(stateDir: string): void {
+  if (lstatQuiet(path.join(stateDir, ATTEMPT_NAME)) !== null) throw failure('package-attempt-unresolved');
 }
 
 /** Resolve a target parent without trusting newly introduced ancestor aliases. */
@@ -951,14 +986,17 @@ export function applyRestore(packet: RestorePacket, opts: TxOptions = {}): Apply
   // ---- first filesystem writes
   if (mkdirExclusive(deps, 'state-mkdir', 'state-failed', state.path) === 'exists') throw failure('state-exists');
   syncDir(deps, 'state-parent-sync', 'state-failed', path.dirname(state.path));
+  requireNoPackageAttempt(state.path);
   const lockSt = createExclusive(deps, 'lock-create', 'lock-failed', path.join(state.path, LOCK_NAME), lockBytes(makeLock(deps, 'state', tx, bootId)));
   if (lockSt === 'exists') throw failure('lock-held');
   ctx.lockId = fileId(lockSt);
   try {
     syncDir(deps, 'lock-dirsync', 'lock-failed', state.path);
+    requireNoPackageAttempt(state.path);
     if (opts.verifyLockedIntent !== undefined && opts.verifyLockedIntent() !== j.planToken) {
       throw failure('activation-approval-mismatch');
     }
+    requireNoPackageAttempt(state.path);
     save(ctx);
     // Under the lock: the targets and their parents are still as validated.
     requireAbsent(absentTarget(agent.path), 'target');
@@ -1124,7 +1162,15 @@ interface LockObs {
   file: string;
 }
 
+interface PackageCapability {
+  readonly state: DirId;
+  readonly lock: FileId;
+  ledger: FileId | null;
+  attempt: FileId | null;
+}
+
 interface Analysis {
+  packageLedger?: { value: PackageLedger; id: FileId };
   stateDir: string;
   j: Journal | null;
   cls: TxClass;
@@ -1236,11 +1282,37 @@ function corruptAnalysis(stateDir: string, reason: string): Analysis {
  * Read-only analysis of a state directory. `ownLock`/`ownGate` let the
  * process that currently holds the writer lock or recovery gate ignore it.
  */
-function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId } = {}, expected?: RestoreTargets): Analysis {
+function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId; pkg?: PackageCapability } = {}, expected?: RestoreTargets): Analysis {
   const uid = deps.uid();
   const dst = lstatQuiet(stateDir);
   if (dst === null || dst === 'error' || !dst.isDirectory() || Number(dst.uid) !== uid || (dst.mode & 0o077n) !== 0n) {
     return corruptAnalysis(stateDir, 'state-unsafe');
+  }
+  // Keep the reserved name outside the allowlist too: a later appearance must
+  // still fail closed even if the metadata probe just observed absence.
+  const attemptStat = lstatQuiet(path.join(stateDir, ATTEMPT_NAME));
+  if (attemptStat !== null && (!own.pkg || own.pkg.attempt === null || attemptStat === 'error' ||
+      !privateFileOk(attemptStat, uid) || !sameFile(attemptStat, own.pkg.attempt))) {
+    return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+  }
+  if (own.pkg && (attemptStat === null && own.pkg.attempt !== null || !sameDir(dst, own.pkg.state))) {
+    return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+  }
+  // Recognizable package locks never reach ordinary stale-owner judging. A
+  // damaged/unreadable lock still fails the existing unproven-lock path.
+  const packageLock = readProven(path.join(stateDir, LOCK_NAME), 1n, LOCK_LIMIT);
+  let isPackageLock = false;
+  if (packageLock) {
+    try {
+      const value = parseJsonBytes(packageLock.bytes);
+      isPackageLock = isObject(value) && value.kind === PACKAGE_LOCK_KIND;
+    } catch { /* Ordinary malformed locks retain their existing classification. */ }
+  }
+  if (isPackageLock && (!own.pkg || !packageLock || !privateFileOk(packageLock.st, uid) || !sameFile(packageLock.st, own.pkg.lock))) {
+    return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+  }
+  if (own.pkg && (!isPackageLock || !packageLock || !sameFile(packageLock.st, own.pkg.lock))) {
+    return corruptAnalysis(stateDir, 'package-attempt-unresolved');
   }
   let names: string[];
   try {
@@ -1260,7 +1332,22 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
     return corruptAnalysis(stateDir, 'state-unsafe');
   }
   for (const n of names) {
-    if (n !== JOURNAL_NAME && n !== LOCK_NAME && n !== GATE_NAME && !TMP_RE.test(n)) return corruptAnalysis(stateDir, 'state-unexpected-entry');
+    if (n === ATTEMPT_NAME && own.pkg?.attempt !== null && own.pkg?.attempt !== undefined) continue;
+    if (n !== JOURNAL_NAME && n !== LOCK_NAME && n !== GATE_NAME && n !== LEDGER_NAME && n !== WORK_NAME && !TMP_RE.test(n) && !LEDGER_TMP_RE.test(n)) return corruptAnalysis(stateDir, 'state-unexpected-entry');
+  }
+  let packageLedger: Analysis['packageLedger'];
+  if (names.includes(LEDGER_NAME)) {
+    const r = readProven(path.join(stateDir, LEDGER_NAME), 1n, LEDGER_LIMIT);
+    if (!r || !privateFileOk(r.st, uid) || own.pkg?.ledger && !sameFile(r.st, own.pkg.ledger)) return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+    try { packageLedger = { value: parseLedger(r.bytes), id: fileId(r.st) }; }
+    catch { return corruptAnalysis(stateDir, 'package-attempt-unresolved'); }
+    const work = lstatQuiet(path.join(stateDir, WORK_NAME));
+    if (!work || work === 'error' || work.isSymbolicLink() || !sameDir(work, packageLedger.value.workParent) ||
+        Number(work.uid) !== uid || (work.mode & 0o077n) !== 0n) return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+    const open = packageLedger.value.runs.find(r => r.state === 'open');
+    if (open && (!own.pkg || own.pkg.ledger === null || canonicalJson(open.lock) !== canonicalJson(own.pkg.lock))) return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+  } else if (names.includes(WORK_NAME) || names.some(n => LEDGER_TMP_RE.test(n)) || own.pkg?.ledger) {
+    return corruptAnalysis(stateDir, 'package-attempt-unresolved');
   }
   const jfile = path.join(stateDir, JOURNAL_NAME);
   const jst = lstatQuiet(jfile);
@@ -1274,6 +1361,15 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
   } catch {
     return corruptAnalysis(stateDir, 'journal-invalid');
   }
+  if (packageLedger && (packageLedger.value.tx !== j.tx || packageLedger.value.planToken !== j.planToken)) return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+  for (const name of names.filter(n => LEDGER_TMP_RE.test(n))) {
+    const r = readProven(path.join(stateDir, name), 1n, LEDGER_LIMIT);
+    if (!r || !privateFileOk(r.st, uid)) return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+    try {
+      const candidate = parseLedger(r.bytes);
+      if (candidate.tx !== j.tx || candidate.planToken !== j.planToken) return corruptAnalysis(stateDir, 'package-attempt-unresolved');
+    } catch { return corruptAnalysis(stateDir, 'package-attempt-unresolved'); }
+  }
   guardPaths([j.targets.agent, j.targets.lens], live);
   if (expected !== undefined && (expected.agent !== j.targets.agent || expected.lens !== j.targets.lens)) {
     throw failure('target-context-mismatch');
@@ -1286,7 +1382,7 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
     return boot;
   };
   const gate = observeLock(path.join(stateDir, GATE_NAME), 'gate', j.tx, deps, bootNow, own.gate ?? null, 'any');
-  const stateLock = observeLock(path.join(stateDir, LOCK_NAME), 'state', j.tx, deps, bootNow, own.lock ?? null, 'any');
+  const stateLock = observeLock(path.join(stateDir, LOCK_NAME), 'state', j.tx, deps, bootNow, own.pkg?.lock ?? own.lock ?? null, 'any');
   const tlFile = path.join(j.targets.agent, TARGET_LOCK_NAME);
   const rootOk = j.root.phase === 'created' && j.root.id !== null && sameDirAt(j.targets.agent, j.root.id);
   let targetLock: LockObs = { state: 'absent', reason: null, record: null, id: null, file: tlFile };
@@ -1298,6 +1394,7 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
   const root = TERMINAL.has(j.status) ? OBS('terminal') : observeRoot(j);
   const outputs = j.outputs.map((o) => ({ o, r: TERMINAL.has(j.status) ? OBS('terminal') : observeOutput(j, o) }));
   const a: Analysis = { stateDir, j, cls: 'corrupt', actions: [], reason: null, gate, stateLock, targetLock, root, outputs };
+  if (packageLedger) a.packageLedger = packageLedger;
   classify(a, j);
   return a;
 }
@@ -1393,9 +1490,37 @@ export function inspectRestore(state: string, opts: TxOptions = {}): InspectResu
   return inspectResult(a, warnings);
 }
 
+/** Private proven applied-state descriptors. Never serialize this snapshot as public output. */
+export interface AppliedRestoreSnapshot {
+  readonly tx: string;
+  readonly planToken: string;
+  readonly platform: Platform;
+  readonly targets: Readonly<RestoreTargets>;
+  readonly outputs: readonly Readonly<{ root: FileRoot; path: string; class: OutputClass; sha256: string; bytes: number }>[];
+}
+
+/** Read-only trusted service; caller must explicitly bind both target roots. */
+export function readAppliedRestore(state: string, tx: string, opts: TxOptions & { expectedTargets: RestoreTargets }): AppliedRestoreSnapshot {
+  if (opts.expectedTargets === undefined) throw invalid('target-context-required');
+  const { deps, live, dir, expected } = openState(state, opts);
+  if (typeof tx !== 'string' || !TX_RE.test(tx)) throw invalid('tx-invalid');
+  const a = analyze(dir, deps, live, {}, expected);
+  if (a.j === null) throw failure('state-corrupt');
+  if (a.j.tx !== tx) throw failure('tx-mismatch');
+  if (a.cls !== 'applied') throw failure('restore-not-applied');
+  return Object.freeze({
+    tx: a.j.tx, planToken: a.j.planToken, platform: a.j.platform,
+    targets: Object.freeze({ agent: a.j.targets.agent, lens: a.j.targets.lens }),
+    outputs: Object.freeze(a.j.outputs.map((o) => Object.freeze({
+      root: o.root, path: o.path, class: o.class, sha256: o.sha256, bytes: o.bytes,
+    }))),
+  });
+}
+
 // ---------------------------------------------------------------- actions
 
 function acquireWriter(dir: string, deps: TxDeps, tx: string): FileId {
+  requireNoPackageAttempt(dir);
   if (lstatQuiet(path.join(dir, GATE_NAME)) !== null) throw failure('gate-held');
   const st = createExclusive(deps, 'lock-create', 'lock-failed', path.join(dir, LOCK_NAME), lockBytes(makeLock(deps, 'state', tx, bootIdOf(deps))));
   if (st === 'exists') throw failure('lock-held');
@@ -1645,4 +1770,325 @@ export function resolveRestore(state: string, req: ResolveRequest, opts: TxOptio
     }, expected);
   }
   return { tx, action, class: expect, removed };
+}
+
+// ---------------------------------------------------------------- trusted fixture package service
+
+export interface LockedPackages {
+  readonly tx: string;
+  readonly planToken: string;
+  readonly packages: readonly PackageDecl[];
+}
+export interface PackageRunOptions extends TxOptions {
+  expectedTargets: RestoreTargets;
+  packageToken: string;
+  verifyLockedPackageIntent(value: LockedPackages): string;
+  protectedRoots: readonly string[];
+}
+export interface PackageRunResult {
+  tx: string;
+  status: 'completed' | 'install-failed';
+  attempted: number;
+  installed: number;
+  failed: null | { index: number; reason: 'exit-nonzero' | 'signal' | 'timeout' | 'output-limit' };
+}
+
+function packageDirAt(file: string, uid: number, expected?: DirId): DirId {
+  const st = lstatQuiet(file);
+  if (!st || st === 'error' || st.isSymbolicLink() || !st.isDirectory() || st.birthtimeNs <= 0n ||
+      Number(st.uid) !== uid || (st.mode & 0o077n) !== 0n || expected && !sameDir(st, expected)) throw failure('package-work-changed');
+  return dirId(st);
+}
+function restoredPackages(j: Journal): PackageDecl[] {
+  const output = j.outputs.find(o => o.class === 'settings');
+  if (!output) return [];
+  const r = readProven(destOf(j, output), 1n, output.bytes);
+  if (!r || output.targetId === null || !sameFile(r.st, output.targetId) || !digestOk(output, r)) throw failure('package-config-drift');
+  try {
+    const settings = parseJsonBytes(r.bytes);
+    if (!isObject(settings)) throw failure('package-config-drift');
+    if (!Object.hasOwn(settings, 'packages')) return [];
+    if (!Array.isArray(settings.packages)) throw failure('package-config-drift');
+    return settings.packages.map(p => packageDecl(p, false));
+  } catch { throw failure('package-config-drift'); }
+}
+function frozenPackages(packages: readonly PackageDecl[]): readonly PackageDecl[] {
+  return Object.freeze(packages.map(p => {
+    const copy = packageDecl(p, false);
+    if (typeof copy !== 'string') {
+      for (const key of ['extensions', 'skills', 'prompts', 'themes'] as const) if (copy[key]) Object.freeze(copy[key]);
+      Object.freeze(copy);
+    }
+    return copy;
+  }));
+}
+function verifyPackageConsent(opts: PackageRunOptions, j: Journal, packages: readonly PackageDecl[]): void {
+  let token: unknown;
+  try { token = opts.verifyLockedPackageIntent(Object.freeze({ tx: j.tx, planToken: j.planToken, packages: frozenPackages(packages) })); }
+  catch { throw failure('package-approval-mismatch'); }
+  if (token !== opts.packageToken) throw failure('package-approval-mismatch');
+}
+function verifyPackageHistory(ledger: PackageLedger, packages: readonly PackageDecl[]): void {
+  let run = -1;
+  let failed = false;
+  for (const a of ledger.attempts) {
+    if (a.run !== run) { run = a.run; failed = false; }
+    if (failed || a.index >= packages.length || a.source !== packageIdentity(packages[a.index])) throw failure('package-history-unverified');
+    failed = a.outcome !== null && a.outcome.code !== 'installed';
+  }
+}
+
+/** Await facts only. Timeout never proves that a child or group stopped. */
+async function packageExitBefore(exit: Promise<PackageExit>, started: number): Promise<PackageExit> {
+  const remaining = 120000 - (performance.now() - started);
+  if (remaining <= 0) throw failure('package-stop-unproven');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([exit, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(failure('package-stop-unproven')), remaining);
+    })]);
+  } catch { throw failure('package-stop-unproven'); }
+  finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
+/**
+ * Trusted fixture-only D1 service. Production has no executor and refuses
+ * before filesystem access. No CLI or environment path supplies the test seam.
+ * All spawning/group facts here are injected fixtures, not real-install proof.
+ * Package locks are purpose-specific and never stale-released by recovery.
+ */
+export async function runPackageAttempts(state: string, tx: string, opts: PackageRunOptions): Promise<PackageRunResult> {
+  const executor = opts?.deps?.packageExecutor;
+  if (typeof executor !== 'function') throw failure('package-executor-unavailable');
+  if (!opts.expectedTargets) throw invalid('target-context-required');
+  if (typeof tx !== 'string' || !TX_RE.test(tx)) throw invalid('tx-invalid');
+  if (!isTokenSyntax(opts.packageToken)) throw invalid('package-approval-token-invalid');
+  if (typeof opts.verifyLockedPackageIntent !== 'function' || !Array.isArray(opts.protectedRoots)) throw invalid('package-options-invalid');
+  const { deps, live, dir, expected } = openState(state, opts);
+  let uid: number;
+  try { uid = deps.uid(); } catch { throw failure('package-owner-unavailable'); }
+  const stateId = packageDirAt(dir, uid);
+  let owner: PackageOwner;
+  try {
+    const hostname = hostnameOf(deps), bootId = bootIdOf(deps), pid = deps.pid();
+    if (!hostname || !bootId || !Number.isSafeInteger(pid) || pid <= 1 || !Number.isSafeInteger(uid) || uid < 0 ||
+        deps.platform !== 'darwin' && deps.platform !== 'linux' || typeof deps.probeGroup !== 'function') throw failure('package-owner-unavailable');
+    owner = { pid, uid, hostname, bootId, platform: deps.platform };
+  } catch { throw failure('package-owner-unavailable'); }
+  const protectedRoots = opts.protectedRoots.map(p => {
+    const arg = requireAbsolute(p, 'usage'); guardLiveLexical(arg, live);
+    return existingDir(arg, 'protected-root-missing').path;
+  });
+  const tool = toolRoot(); if (tool !== null) protectedRoots.push(tool);
+  for (const root of protectedRoots) for (const own of [dir, expected!.agent, ...(expected!.lens ? [expected!.lens] : [])]) {
+    if (overlaps(root, own)) throw invalid('roots-overlap');
+  }
+  if (overlaps(dir, expected!.agent) || expected!.lens && overlaps(dir, expected!.lens)) throw invalid('roots-overlap');
+  requireNoPackageAttempt(dir);
+  if (lstatQuiet(path.join(dir, GATE_NAME)) !== null) throw failure('gate-held');
+  const lockFile = path.join(dir, LOCK_NAME);
+  const lockContent = Buffer.from(`${canonicalJson({ schemaVersion: 1, kind: PACKAGE_LOCK_KIND, role: 'state', tx, ...owner })}\n`);
+  // No cleanup adopts a lock whose exclusive-create primitive did not return.
+  let lockStat: fs.BigIntStats | 'exists';
+  try { lockStat = createExclusive(deps, 'pkglock-create', 'package-lock-failed', lockFile, lockContent); }
+  catch { throw failure('package-lock-failed'); }
+  if (lockStat === 'exists') throw failure('lock-held');
+  if (!privateFileOk(lockStat, uid) || lockStat.birthtimeNs <= 0n) throw failure('package-lock-failed');
+  const cap: PackageCapability = { state: stateId, lock: fileId(lockStat), ledger: null, attempt: null };
+  let retain = false;
+  const workRoot = path.join(dir, WORK_NAME);
+  let workParent: DirId | null = null;
+  let active: { dir: string; id: DirId; dirs: Map<string, DirId>; configs: Map<string, FileId> } | null = null;
+  // Recheck live file capabilities too: directory identity alone does not
+  // retain writer authority after an await or a fixture-injected replacement.
+  const checkDirs = (): void => {
+    packageDirAt(dir, uid, stateId);
+    const held = lstatQuiet(lockFile);
+    if (!held || held === 'error' || !privateFileOk(held, uid) || !sameFile(held, cap.lock)) throw failure('package-attempt-unresolved');
+    if (cap.ledger !== null) {
+      const st = lstatQuiet(path.join(dir, LEDGER_NAME));
+      if (!st || st === 'error' || !privateFileOk(st, uid) || !sameFile(st, cap.ledger)) throw failure('package-attempt-unresolved');
+    }
+    const attempt = lstatQuiet(path.join(dir, ATTEMPT_NAME));
+    if (cap.attempt === null ? attempt !== null : !attempt || attempt === 'error' || !privateFileOk(attempt, uid) || !sameFile(attempt, cap.attempt)) throw failure('package-attempt-unresolved');
+    if (workParent) packageDirAt(workRoot, uid, workParent);
+    if (active) {
+      packageDirAt(active.dir, uid, active.id);
+      for (const [name, id] of active.dirs) packageDirAt(path.join(active.dir, name), uid, id);
+      for (const [name, id] of active.configs) {
+        const r = readProven(path.join(active.dir, name), 1n, 0);
+        if (!r || !privateFileOk(r.st, uid) || !sameFile(r.st, id) || r.bytes.length !== 0) throw failure('package-work-changed');
+      }
+    }
+  };
+  const release = (): void => {
+    checkDirs();
+    const removed = unlinkProven(deps, 'pkglock-release', 'package-lock-release-failed', lockFile, st => privateFileOk(st, uid) && sameFile(st, cap.lock));
+    if (removed !== 'removed') throw failure('package-lock-release-failed');
+    syncDir(deps, 'pkglock-release-sync', 'package-lock-release-failed', dir);
+    packageDirAt(dir, uid, stateId);
+  };
+  const observeGroup = (pgid: number): 'alive' | 'esrch' | 'eperm' | 'unknown' => {
+    try { return deps.probeGroup?.(pgid) ?? 'unknown'; } catch { return 'unknown'; }
+  };
+  try {
+    syncDir(deps, 'pkglock-dirsync', 'package-lock-failed', dir);
+    const proof = readProven(lockFile, 1n, LOCK_LIMIT);
+    if (!proof || !sameFile(proof.st, cap.lock) || !proof.bytes.equals(lockContent)) throw failure('package-lock-failed');
+    let initial = analyze(dir, deps, live, { pkg: cap }, expected);
+    if (initial.j === null || initial.j.tx !== tx) throw failure('state-corrupt');
+    if (initial.cls !== 'applied' || initial.j.platform !== owner.platform) throw failure('restore-not-applied');
+    const j = initial.j;
+    const jr = readProven(path.join(dir, JOURNAL_NAME), 1n, MIB);
+    if (!jr || canonicalJson(parseJournal(jr.bytes)) !== canonicalJson(j)) throw failure('state-corrupt');
+    const journalId = fileId(jr.st), journalDigest = sha256Hex(jr.bytes);
+    const packages = restoredPackages(j);
+    verifyPackageConsent(opts, j, packages);
+    const old = initial.packageLedger;
+    if (old) { verifyPackageHistory(old.value, packages); cap.ledger = old.id; workParent = old.value.workParent; }
+    const checkCurrent = (): void => {
+      checkDirs();
+      const a = analyze(dir, deps, live, { pkg: cap }, expected);
+      if (a.j === null || a.j.tx !== tx || a.cls !== 'applied') throw failure('package-config-drift');
+      const r = readProven(path.join(dir, JOURNAL_NAME), 1n, MIB);
+      if (!r || !sameFile(r.st, journalId) || sha256Hex(r.bytes) !== journalDigest) throw failure('package-config-drift');
+      verifyPackageConsent(opts, a.j, packages);
+    };
+    if (packages.length === 0) { checkCurrent(); release(); return { tx, status: 'completed', attempted: 0, installed: 0, failed: null }; }
+    const count = old?.value.nextSeq ?? 0, run = old?.value.runs.length ?? 0;
+    if (run >= MAX_RUNS || count + packages.length > MAX_ATTEMPTS) throw failure('package-attempt-limit');
+    if (old) {
+      const known = new Map(old.value.attempts.map(a => [a.work.name, a.work.id]));
+      const directory = fs.opendirSync(workRoot);
+      let entries = 0;
+      try {
+        for (;;) {
+          const e = directory.readSync(); if (!e) break;
+          if (++entries > MAX_ATTEMPTS || !known.has(e.name)) throw failure('package-work-changed');
+          const id = known.get(e.name); if (!id) throw failure('package-work-changed');
+          packageDirAt(path.join(workRoot, e.name), uid, id);
+        }
+      } finally { directory.closeSync(); }
+      if (entries !== known.size) throw failure('package-work-changed');
+    }
+    const wide: DirId = { dev: '9'.repeat(20), ino: '9'.repeat(20), birthtimeNs: '9'.repeat(20) };
+    const header = { run, state: 'open' as const, packageToken: opts.packageToken, lock: cap.lock, owner };
+    const base: PackageLedger = old?.value ?? { schemaVersion: 1, kind: LEDGER_KIND, tool: TOOL_ID, tx, planToken: j.planToken,
+      workParent: wide, nextSeq: 0, runs: [], attempts: [] };
+    // Preflight every future terminal representation before non-lock writes.
+    ledgerBytes({ ...base, workParent: wide, nextSeq: count + packages.length, runs: [...base.runs, header],
+      attempts: [...base.attempts, ...packages.map((p, index) => ({ seq: count + index, run, index, source: packageIdentity(p),
+        work: { name: `w${count + index}-${'f'.repeat(16)}`, id: wide },
+        outcome: { code: 'output-limit' as const, exit: { code: null, signal: 'SIGKILL' as const, stdoutBytes: MIB + 1, stderrBytes: MIB + 1 } } }))] });
+    for (let index = 0; index < packages.length; index++) attemptBytes({ schemaVersion: 1, kind: ATTEMPT_KIND, tool: TOOL_ID, tx,
+      planToken: j.planToken, packageToken: opts.packageToken, seq: count + index, run, index, source: packageIdentity(packages[index]), owner,
+      work: { name: `w${count + index}-${'f'.repeat(16)}`, id: wide }, phase: 'config-verified',
+      child: { pid: Number.MAX_SAFE_INTEGER, pgid: Number.MAX_SAFE_INTEGER },
+      exit: { code: null, signal: 'SIGKILL', stdoutBytes: MIB + 1, stderrBytes: MIB + 1, timedOut: false, overflow: false } });
+    retain = true;
+    if (!workParent) {
+      if (mkdirExclusive(deps, 'work-root-mkdir', 'package-work-changed', workRoot) === 'exists') throw failure('package-work-changed');
+      syncDir(deps, 'work-root-sync', 'package-work-changed', dir);
+      workParent = packageDirAt(workRoot, uid);
+    }
+    let ledger: PackageLedger = parseLedger(ledgerBytes({ ...base, workParent, runs: [...base.runs, header] }));
+    const saveLedger = (): void => {
+      checkDirs();
+      cap.ledger = replacePrivate(deps, dir, 'ledger', cap.ledger, ledgerBytes(ledger));
+    };
+    saveLedger();
+    let attempted = 0, installed = 0;
+    let failed: PackageRunResult['failed'] = null;
+    for (let index = 0; index < packages.length; index++) {
+      checkCurrent();
+      const seq = ledger.nextSeq, suffix = deps.randomHex(8);
+      if (!/^[0-9a-f]{16}$/.test(suffix)) throw failure('random-failed');
+      const name = `w${seq}-${suffix}`, source = packageIdentity(packages[index]);
+      ledger.attempts.push({ seq, run, index, source, work: { name, id: null }, outcome: null });
+      ledger.nextSeq++;
+      saveLedger();
+      const wd = path.join(workRoot, name);
+      if (mkdirExclusive(deps, 'work-mkdir', 'package-work-changed', wd) === 'exists') throw failure('package-work-changed');
+      active = { dir: wd, id: packageDirAt(wd, uid), dirs: new Map(), configs: new Map() };
+      for (const name of ['cwd', 'tmp', 'cache']) {
+        const sub = path.join(wd, name);
+        if (mkdirExclusive(deps, 'work-mkdir', 'package-work-changed', sub) === 'exists') throw failure('package-work-changed');
+        active.dirs.set(name, packageDirAt(sub, uid));
+        syncDir(deps, 'work-dirsync', 'package-work-changed', wd);
+      }
+      for (const name of ['userconfig', 'globalconfig']) {
+        const st = createExclusive(deps, 'work-file', 'package-work-changed', path.join(wd, name), Buffer.alloc(0));
+        if (st === 'exists' || !privateFileOk(st, uid) || st.birthtimeNs <= 0n) throw failure('package-work-changed');
+        active.configs.set(name, fileId(st));
+      }
+      syncDir(deps, 'work-dirsync', 'package-work-changed', wd);
+      syncDir(deps, 'work-dirsync', 'package-work-changed', workRoot);
+      checkCurrent();
+      let record: AttemptRecord = { schemaVersion: 1, kind: ATTEMPT_KIND, tool: TOOL_ID, tx, planToken: j.planToken, packageToken: opts.packageToken,
+        seq, run, index, source, owner, work: { name, id: active.id }, phase: 'intent', child: null, exit: null };
+      const content = attemptBytes(record);
+      const st = createExclusive(deps, 'attempt-create', 'package-attempt-write-failed', path.join(dir, ATTEMPT_NAME), content);
+      if (st === 'exists' || !privateFileOk(st, uid) || st.birthtimeNs <= 0n) throw failure('package-attempt-unresolved');
+      syncDir(deps, 'attempt-dirsync', 'package-attempt-write-failed', dir);
+      const intent = readProven(path.join(dir, ATTEMPT_NAME), 1n, content.length);
+      if (!intent || !sameFile(intent.st, fileId(st)) || !intent.bytes.equals(content)) throw failure('package-attempt-unresolved');
+      cap.attempt = fileId(intent.st);
+      const advance = (next: AttemptRecord): void => {
+        checkDirs(); checkAdvance(record, next);
+        const id = replacePrivate(deps, dir, 'attempt', cap.attempt, attemptBytes(next));
+        cap.attempt = id; record = parseAttempt(attemptBytes(next));
+      };
+      checkCurrent();
+      const started = performance.now();
+      let spawned: ReturnType<NonNullable<TxDeps['packageExecutor']>>;
+      try {
+        spawned = executor({ source, agentDir: j.targets.agent, timeoutMs: 120000,
+          work: { cwd: path.join(wd, 'cwd'), tmp: path.join(wd, 'tmp'), cache: path.join(wd, 'cache'),
+            userconfig: path.join(wd, 'userconfig'), globalconfig: path.join(wd, 'globalconfig') } });
+        if (!spawned || !Number.isSafeInteger(spawned.pid) || spawned.pid <= 1 || !(spawned.exit instanceof Promise)) throw failure('package-spawn-unresolved');
+      } catch { throw failure('package-spawn-unresolved'); }
+      // Observe rejections immediately, including failures before spawned publication.
+      void spawned.exit.catch(() => {});
+      if (observeGroup(spawned.pid) !== 'alive') throw failure('package-spawn-unresolved');
+      try { advance({ ...record, phase: 'spawned', child: { pid: spawned.pid, pgid: spawned.pid } }); }
+      catch {
+        await packageExitBefore(spawned.exit, started);
+        throw failure('package-attempt-write-failed');
+      }
+      attempted++;
+      const facts = await packageExitBefore(spawned.exit, started);
+      checkDirs();
+      if (observeGroup(spawned.pid) !== 'esrch') throw failure('package-stop-unproven');
+      advance({ ...record, phase: 'stopped-proven', exit: facts });
+      checkCurrent();
+      advance({ ...record, phase: 'config-verified' });
+      const e = record.exit!;
+      // Raw flags are diagnostic: the service independently enforces each cap.
+      const outcome = outcomeForExit({ ...e, overflow: e.overflow || e.stdoutBytes > MIB || e.stderrBytes > MIB });
+      ledger.attempts[seq] = { seq, run, index, source, work: { name, id: active.id }, outcome };
+      saveLedger();
+      checkCurrent();
+      const removed = unlinkProven(deps, 'attempt-unlink', 'package-attempt-retained', path.join(dir, ATTEMPT_NAME), s => cap.attempt !== null && privateFileOk(s, uid) && sameFile(s, cap.attempt));
+      if (removed !== 'removed') throw failure('package-attempt-retained');
+      syncDir(deps, 'attempt-unlink-dirsync', 'package-attempt-retained', dir);
+      cap.attempt = null;
+      if (outcome.code === 'installed') installed++;
+      else { failed = { index, reason: outcome.code }; break; }
+      active = null;
+    }
+    checkCurrent();
+    ledger.runs[run].state = 'closed';
+    saveLedger();
+    release();
+    return { tx, status: failed === null ? 'completed' : 'install-failed', attempted, installed, failed };
+  } catch (e) {
+    if (!retain) bestEffort(release);
+    // No injected exception payload, including a custom ToolError, is output.
+    const safe = new Set(['state-corrupt', 'restore-not-applied', 'package-approval-mismatch', 'package-attempt-limit', 'package-history-unverified',
+      'package-work-changed', 'package-lock-failed', 'package-lock-release-failed', 'package-attempt-unresolved', 'package-config-drift',
+      'package-ledger-write-failed', 'package-attempt-write-failed', 'package-attempt-retained', 'package-stop-unproven', 'package-spawn-unresolved',
+      'package-attempt-invalid', 'package-ledger-invalid', 'package-attempt-transition', 'filesystem-error', 'random-failed', 'target-context-mismatch']);
+    if (e instanceof ToolError && safe.has(e.code)) throw failure(e.code);
+    throw failure('package-restore-failed');
+  }
 }

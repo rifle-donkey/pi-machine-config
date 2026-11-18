@@ -1058,7 +1058,7 @@ describe('prohibited source paths', () => {
 // ================================================================ theme and built-in readiness (I2)
 
 describe('theme and built-in readiness', () => {
-  it('reports theme files and custom theme names as unvalidated, without a token', () => {
+  it('reports invalid theme files and unresolved custom theme names without a token', () => {
     for (const content of ['null\n', '{}\n', '{"name":"mine","colors":{}}\n']) {
       const f = fixture(policyFor({ common: { settings: ['theme'], files: [{ root: 'agent', path: 'themes/mine.json', class: 'theme', template: false }] } }));
       put(path.join(f.agent, 'themes', 'mine.json'), content);
@@ -1072,7 +1072,7 @@ describe('theme and built-in readiness', () => {
       assert.equal(r.out?.approvalToken, null);
       assert.deepEqual(
         (r.out?.items as Obj[]).filter((i) => i.operation === 'incomplete').map((i) => [i.kind, i.reason]),
-        [['setting', 'theme-reference-unverified'], ['file', 'schema-adapter-unavailable']],
+        [['setting', 'theme-reference-unverified'], ['file', 'theme-invalid']],
       );
     }
     const dup = fixture(policyFor({ common: { files: [{ root: 'agent', path: 'themes/dark.json', class: 'theme', template: false }] } }));

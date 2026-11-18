@@ -1,4 +1,5 @@
 node_modules/
+.npm-cache/
 coverage/
 # Fixture scratch only; production overlays and state must stay outside this repo.
 .local/

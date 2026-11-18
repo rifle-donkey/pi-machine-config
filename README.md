@@ -25,7 +25,7 @@ Six fixture-only commands are available: `capture-review`, `capture`, `plan`, `a
 
 Every command protects `.pi` and `.pi-lens` under both the account-database home and any absolute `$HOME` selected by Pi, plus `$PI_CODING_AGENT_DIR`. Changing `$HOME` never removes account-home protection. This release therefore works only with fixture directories, not with a live Pi installation. To also catch symlinked aliases of those locations, each command resolves their real paths. That queries path metadata (whether they exist and where symlinks point); it never opens or reads anything inside them.
 
-The commands run directly from a checkout with Node's built-in TypeScript support and have no dependencies. They are tested with Node 26; the intended Node 24 baseline is not yet verified.
+The commands run directly from a checkout with Node's built-in TypeScript support. The checkout pins `@babel/parser` 7.28.5 with a reviewed dependency lockfile; parser-backed extension analysis remains unavailable. Dependency installation must disable lifecycle scripts and never installs captured Pi packages. The commands are tested with Node 26; the intended Node 24 baseline is not yet verified.
 
 ## Safety rules
 
@@ -64,7 +64,7 @@ Only a `ready` plan can activate. Incomplete schema, dependency or resource chec
 1. Use `recover --inspect` with the original state path, `--target-agent` and, when present, `--lens-config`. The target context must match the private journal before any target access. Inspection is read-only and never breaks locks.
 2. To undo owned unchanged configuration, run `rollback` with the same context and exact `--tx`. The whole dependency group is preflighted; changed or replaced output refuses cleanup. Directories, package installations, runtime files and unknown files remain. Repetition never removes a later replacement.
 3. After an interruption, inspect first. Use `recover --resolve` only with the reported transaction ID, exact current `--expect` class and an offered `--action`. A stale classification refuses rather than retrying automatically. A successful resolution reports `previousClass`; inspect again for the current state.
-4. Locks require proven stale ownership; no force or automatic breaking exists. Missing boot identity, a live or unprovable owner, corrupt state or unknown identity requires stopping and separately reviewed manual recovery. Do not edit a journal or blindly delete locks/state. `PI_OFFLINE=1` stops missing-package auto-installation, not execution of already installed extensions.
+4. Locks require proven stale ownership; no force or automatic breaking exists. Missing boot identity, a live or unprovable owner, corrupt state or unknown identity requires stopping and separately reviewed manual recovery. Do not edit a journal or blindly delete locks/state. Never delete the reserved `package-attempt.json` entry to unblock recovery. `PI_OFFLINE=1` stops missing-package auto-installation, not execution of already installed extensions.
 
 | Inspection class | Offered action or next step |
 |---|---|
@@ -75,7 +75,7 @@ Only a `ready` plan can activate. Incomplete schema, dependency or resource chec
 | `applied`, `partial`, `rollback-pending` | `rollback` |
 | `conflict` | `record-conflict` preserves unproven outputs; it does not repair them |
 | `rolled-back`, `closed`, `preserved` | Terminal history; no automatic cleanup of replacements |
-| `corrupt`, held or unprovable locks | No automated action; retain evidence and stop |
+| `corrupt`, held or unprovable locks | No automated action; retain evidence and stop. For `corrupt`, lock fields are unobserved, not proof that locks are absent. |
 
 Moving target parents can make even terminal inspection refuse. Rollback retains the agent directory, so applying again to the same path requires a separately approved removal or a new target. A failed lock release can retain its intent and consume a bounded recovery slot. No power-loss or hostile same-user pathname-race guarantee is claimed.
 
@@ -140,6 +140,7 @@ Codes you may need to act on:
 | `activation-approval-required` | `2` | Apply requires the explicit reviewed plan token. |
 | `activation-approval-mismatch`, `plan-not-ready` | `1` | The current complete ready intent no longer matches the activation token, or the plan cannot activate. No target configuration is created. |
 | `target-context-mismatch` | `1` | The target flags do not match the transaction; target access is refused. |
+| `package-attempt-unresolved` | `1` | Package-operation state is unresolved: an attempt entry, recognizable package writer lock, or invalid/open audit state blocks recovery. Inspection reports `corrupt` with no actions; ordinary operations never inspect attempt contents or probe package-lock owners for stale release. Preserve all evidence and stop for separately reviewed manual recovery. Neither a stale coordinator PID nor a changed boot authorizes clearing package exclusion. |
 | `tx-mismatch`, `expect-mismatch`, `rollback-conflict` | `1` | Transaction, observed class or owned output changed; inspect before another explicit action. |
 | `inclusion-approval-mismatch` | `1` | The inputs no longer match the reviewed token; nothing was created. |
 | `inclusion-approval-missing`, `inclusion-approval-digest-mismatch`, `inclusion-approval-invalid`, `inclusion-approval-bundle-mismatch` | `2` | The bundle's approval record is absent, altered, inconsistent, or does not describe this bundle. |
@@ -235,6 +236,24 @@ The only exceptions are the exact destinations in the table above: `AGENTS.md` a
 
 **Overlay section.** `overlay.files` lists the overlay files a machine overlay may contain; `overlay.packagesRemove` lists the package identities it may remove.
 
+### Local prompt reference checks
+
+Positive `prompts` entries can be verified as exact `prompts/<name>.md` paths, optionally prefixed with `+`, when there are no package declarations. Names start with an ASCII letter or digit and contain only ASCII letters, digits, dots, underscores and hyphens. Every reference must match an approved selected prompt file; duplicates do not produce duplicate files.
+
+For this positive-reference subset, every selected prompt must have a supported name and be plain Markdown without a closed frontmatter block. The check accounts for one leading BOM and CRLF/CR newlines; repeated BOMs are unsupported. Files, BOMs, newlines and `$1`/`$@` argument placeholders are copied unchanged. An unsupported sibling also blocks the setting because Pi auto-discovers all selected prompt files, not just the referenced file.
+
+Directories, globs, aliases, mixed exclusions, packages, missing files and closed frontmatter keep the positive setting incomplete. Empty and negative-only settings and file-only prompt classifications keep their existing behavior; this is not a general YAML validator. Runtime project/CLI overrides and command-name conflicts are not checked by this subset.
+
+### Local theme readiness
+
+Selected local themes are checked against the Pi 1.5.2 theme schema without loading Pi. The JSON `name` must equal the filename stem and cannot be `system`, `dark` or `light`. Only `$schema`, `name`, `appearance`, `vars`, `colors` and `export` are accepted. All required color roles must be present; the native fallback roles may remain omitted. Unknown roles, missing references, cycles and invalid export colors prevent readiness. Unused variables are checked too; source bytes are never rewritten.
+
+Supported colors are three/six-digit RGB hex, integer ANSI indices 0–255, the empty terminal-default string, variable references, and native OKLCH/OKHSL syntax with finite values and native ranges. The conservative subset limits absolute hue and OKLCH chroma to 1,000,000. OKHSL lightness must be exactly 0 or 1, or within 0.000001–0.999999, to avoid numerical extremes in runtime conversion. Variable chains contain at most 32 names including the first reference; variables, keys and strings also obey the [limits](#limits).
+
+A custom `theme` setting, including both sides of an automatic light/dark pair, resolves only to validated selected local files with no package declarations and an absent or empty `themes` selection array. Package themes and nonempty theme selections are not inferred from declarations. Semantically invalid or unsupported strict-JSON themes may be captured, but cannot activate; the plan remains incomplete.
+
+A ready plan validates the approved agent target, not every runtime context. Trusted project themes, project settings and Pi command-line theme overrides can still change which theme Pi uses.
+
 ### Bundle layout and layer manifests
 
 ```
@@ -290,9 +309,11 @@ Each plan item is a `setting`, `package`, `file` or `target` with one operation:
 Current `incomplete` reasons:
 
 - `dependency-analysis-unavailable`: `extension-source` and `skill-source` files (imports, local dependencies and executable bits are not checked yet).
-- `schema-adapter-unavailable`: `theme`, `tool-config` and `external-config` files. Strict JSON alone does not make a valid Pi theme or tool configuration.
-- `resource-reference-unverified`: a resource selection that activates a local path. Built-in extension values and `-`/`!` exclusions are accepted.
-- `theme-reference-unverified`: a `theme` setting that names a custom theme rather than `system`, `dark` or `light`.
+- `schema-adapter-unavailable`: `tool-config` and `external-config` files. Strict JSON alone does not make a valid tool configuration.
+- `theme-invalid`: a selected theme is invalid or outside the supported [local theme subset](#local-theme-readiness).
+- `package-theme-discovery-unverified`: a validated local theme is combined with package declarations; their theme discovery/collisions have not been inspected.
+- `resource-reference-unverified`: a positive local resource selection outside the [exact prompt subset](#local-prompt-reference-checks), or a prompt lookup whose selected files, discovery or format cannot be verified. Built-in extension values and negative-only selections retain their existing behavior.
+- `theme-reference-unverified`: a custom theme name lacks a validated selected local file, or package declarations/nonempty theme selections prevent proving the lookup.
 
 `conflict` reasons are `target-exists` (anything, including an empty directory or a dangling symlink), `target-alias-exists` (a case or Unicode-normalization alias of the target exists) and `target-parent-missing`. An existing target is never adopted or overwritten.
 

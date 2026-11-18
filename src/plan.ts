@@ -15,6 +15,8 @@
 import os from 'node:os';
 import path from 'node:path';
 import { invalid } from './errors.ts';
+import { themeReady } from './theme.ts';
+import { promptReferencesReady } from './prompts.ts';
 import {
   absentTarget,
   existingDir,
@@ -87,6 +89,8 @@ export interface PreparedFile {
 /** Compilation is not authorization: callers must require ready and match the token. */
 export interface PreparedPlan {
   result: PlanResult;
+  /** Private comparison for proven existing restores; never an activation token. */
+  intentToken: string | null;
   settings: JsonObject;
   packages: PackageDecl[];
   files: PreparedFile[];
@@ -97,14 +101,13 @@ export interface PreparedPlan {
 /**
  * Classes whose readiness needs an adapter this release does not have yet:
  * local-resource import/dependency analysis and executable-bit needs for
- * extension/skill sources, reviewed schema adapters for theme, tool and
- * external configuration (strict JSON alone does not make a valid Pi theme).
+ * extension/skill sources and reviewed schema adapters for tool and external
+ * configuration. Themes have a separate bounded adapter and discovery gate.
  * They are reported, never silently omitted.
  */
 const INCOMPLETE_CLASSES: ReadonlyMap<FileClass, string> = new Map([
   ['extension-source', 'dependency-analysis-unavailable'],
   ['skill-source', 'dependency-analysis-unavailable'],
-  ['theme', 'schema-adapter-unavailable'],
   ['tool-config', 'schema-adapter-unavailable'],
   ['external-config', 'schema-adapter-unavailable'],
 ]);
@@ -161,13 +164,22 @@ export function preparePlan(opts: PlanOptions): PreparedPlan {
   if (needLens && !lens) throw invalid('lens-config-required');
   if (!needLens && lens) throw invalid('lens-config-unused');
 
+  // Inspect only winning, already-approved payloads. Never scan a live theme
+  // directory or infer package contents from an uninstalled declaration.
+  const themes = new Map<string, boolean>();
+  for (const f of merged.files) if (f.record.class === 'theme') {
+    themes.set(f.record.path, themeReady(f.bytes, path.basename(f.record.path, '.json')));
+  }
+  const canResolveLocalThemes = merged.packages.length === 0 &&
+    (!Array.isArray(merged.settings.themes) || merged.settings.themes.length === 0);
   const items: PlanItem[] = [];
   for (const key of Object.keys(merged.settings)) {
     const v = merged.settings[key];
-    if (isResourceSetting(key) && Array.isArray(v) && v.some((e) => typeof e === 'string' && isPositiveLocalEntry(e))) {
+    if (isResourceSetting(key) && Array.isArray(v) && v.some((e) => typeof e === 'string' && isPositiveLocalEntry(e)) &&
+      !(key === 'prompts' && promptReferencesReady(v as string[], merged.files, merged.packages.length > 0))) {
       items.push({ kind: 'setting', key, operation: 'incomplete', reason: 'resource-reference-unverified' });
-    } else if (key === 'theme' && typeof v === 'string' && !isBuiltinThemeSetting(v)) {
-      // A custom theme name refers to a theme file this release cannot validate.
+    } else if (key === 'theme' && typeof v === 'string' && !isBuiltinThemeSetting(v) &&
+      (!canResolveLocalThemes || v.split('/').some((name) => !isBuiltinThemeSetting(name) && themes.get(`themes/${name}.json`) !== true))) {
       items.push({ kind: 'setting', key, operation: 'incomplete', reason: 'theme-reference-unverified' });
     } else {
       items.push({ kind: 'setting', key, operation: ACTIVATION_SETTINGS.has(key) ? 'activation-required' : 'create' });
@@ -191,7 +203,9 @@ export function preparePlan(opts: PlanOptions): PreparedPlan {
     const sha256 = sha256Hex(out);
     rendered.push({ root: record.root, path: record.path, class: record.class, template: record.template, target, sha256 });
     files.push({ root: record.root, path: record.path, class: record.class, bytes: Buffer.from(out), sha256 });
-    const reason = INCOMPLETE_CLASSES.get(record.class);
+    const reason = record.class === 'theme'
+      ? themes.get(record.path) !== true ? 'theme-invalid' : merged.packages.length > 0 ? 'package-theme-discovery-unverified' : undefined
+      : INCOMPLETE_CLASSES.get(record.class);
     const base = { kind: 'file' as const, root: record.root, path: record.path, class: record.class };
     if (reason) items.push({ ...base, operation: 'incomplete', reason });
     else items.push({ ...base, operation: ACTIVATION_CLASSES.has(record.class) ? 'activation-required' : 'create' });
@@ -206,8 +220,10 @@ export function preparePlan(opts: PlanOptions): PreparedPlan {
     : items.some((i) => i.operation === 'incomplete')
       ? 'incomplete'
       : 'ready';
-  let approvalToken: string | null = null;
-  if (status === 'ready') {
+  let intentToken: string | null = null;
+  const comparable = items.every((item) => item.operation === 'create' || item.operation === 'activation-required' ||
+    (item.kind === 'target' && item.operation === 'conflict' && item.reason === 'target-exists'));
+  if (comparable) {
     const doc = tokenDocument({
       bundle: {
         policy: bundle.policySha256,
@@ -221,10 +237,12 @@ export function preparePlan(opts: PlanOptions): PreparedPlan {
       files: rendered,
       targets: { agent: agent.path, lensConfig: lens ? lens.path : null },
     });
-    approvalToken = planToken(doc);
+    intentToken = planToken(doc);
   }
+  const approvalToken = status === 'ready' ? intentToken : null;
   return {
     result: { status, platform: opts.platform, overlay: overlay !== undefined, items, approvalToken },
+    intentToken,
     settings: merged.settings,
     packages: merged.packages,
     files,

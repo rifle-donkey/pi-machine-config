@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ToolError, failure } from './errors.ts';
+import { ATTEMPT_LIMIT, LEDGER_LIMIT, type PackageExit } from './package-attempt.ts';
 
 const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK, O_WRONLY, O_CREAT, O_EXCL } = fs.constants;
 
@@ -33,6 +34,18 @@ const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK, O_WRONLY, O_CREAT, O_EXCL } = fs.const
 
 /** Result of `kill(pid, 0)`: alive, no such process, not permitted, or anything else. */
 export type PidProbe = 'alive' | 'esrch' | 'eperm' | 'unknown';
+
+/** Trusted fixture executor facts only; no phase, ownership or cleanup authority. */
+export interface PackageSpawnSpec {
+  readonly source: string;
+  readonly agentDir: string;
+  readonly timeoutMs: 120000;
+  readonly work: Readonly<{ cwd: string; tmp: string; cache: string; userconfig: string; globalconfig: string }>;
+}
+export type PackageExecutor = (spec: PackageSpawnSpec) => {
+  readonly pid: number;
+  readonly exit: Promise<PackageExit>;
+};
 
 /**
  * Operating-system dependencies. `systemDeps()` supplies the real ones;
@@ -48,6 +61,10 @@ export interface TxDeps {
   uid(): number;
   pid(): number;
   probePid(pid: number): PidProbe;
+  /** Internal fixture seam only; the production default is always null. */
+  packageExecutor?: PackageExecutor | null;
+  /** Read-only group observation; never authorizes signaling a recorded group. */
+  probeGroup?(pgid: number): PidProbe;
   /** Lowercase hex from `bytes` random bytes. */
   randomHex(bytes: number): string;
   /** Internal test seam called before each mutating step. Throwing simulates a failure there. */
@@ -121,6 +138,17 @@ export function systemDeps(): TxDeps {
       if (!Number.isSafeInteger(pid) || pid <= 1) return 'unknown';
       try {
         process.kill(pid, 0);
+        return 'alive';
+      } catch (e) {
+        const c = errCode(e);
+        return c === 'ESRCH' ? 'esrch' : c === 'EPERM' ? 'eperm' : 'unknown';
+      }
+    },
+    packageExecutor: null,
+    probeGroup: (pgid: number): PidProbe => {
+      if (!Number.isSafeInteger(pgid) || pgid <= 1) return 'unknown';
+      try {
+        process.kill(-pgid, 0);
         return 'alive';
       } catch (e) {
         const c = errCode(e);
@@ -356,6 +384,73 @@ export function replaceFile(deps: TxDeps, dir: string, name: string, bytes: Uint
     fs.renameSync(tmp, path.join(dir, name));
   });
   syncDir(deps, 'journal-dirsync', code, dir);
+}
+
+/** Closed package-state destinations; never accepts an arbitrary basename. */
+export type PrivateStateKind = 'ledger' | 'attempt';
+
+/**
+ * Atomically publish private package state under the trusted service's writer
+ * lock. The caller supplies a canonical guarded state directory, validated
+ * bytes and the exact old file identity (null only for an absent destination).
+ * This is not an ownership capability and is never wired to CLI input.
+ *
+ * Keep replaceFile's journal protocol and fault points unchanged. Package
+ * replacement additionally proves the old destination, private parent, staged
+ * bytes and new inode. Refresh ctime only after the known rename and successful
+ * directory sync. Any failure preserves all residue for exclusion; no cleanup
+ * or visible-but-unsynced publication is reported as committed.
+ */
+export function replacePrivate(
+  deps: TxDeps, dir: string, kind: PrivateStateKind,
+  expected: FileId | null, bytes: Uint8Array,
+): FileId {
+  if (kind !== 'ledger' && kind !== 'attempt') throw failure('package-state-kind-invalid');
+  const code = kind === 'ledger' ? 'package-ledger-write-failed' : 'package-attempt-write-failed';
+  return guarded(code, () => {
+    const limit = kind === 'ledger' ? LEDGER_LIMIT : ATTEMPT_LIMIT;
+    if (!(bytes instanceof Uint8Array) || bytes.length > limit) throw failure(code);
+    const copy = Buffer.from(bytes);
+    const name = kind === 'ledger' ? 'package-ledger.json' : 'package-attempt.json';
+    const destination = path.join(dir, name);
+    const parent = lstatOrNull(dir);
+    const uid = deps.uid();
+    if (!parent || parent.isSymbolicLink() || !parent.isDirectory() || parent.birthtimeNs <= 0n ||
+        Number(parent.uid) !== uid || (parent.mode & 0o077n) !== 0n) throw failure(code);
+    const parentId = dirId(parent);
+    const privateFile = (st: fs.BigIntStats): boolean => st.isFile() && !st.isSymbolicLink() &&
+      st.nlink === 1n && st.birthtimeNs > 0n && Number(st.uid) === uid && (st.mode & 0o777n) === 0o600n;
+    const checkParent = (): void => {
+      const st = lstatOrNull(dir);
+      if (!st || st.isSymbolicLink() || !sameDir(st, parentId) || Number(st.uid) !== uid || (st.mode & 0o077n) !== 0n) throw failure(code);
+    };
+    const checkOld = (): void => {
+      const st = lstatOrNull(destination);
+      if (expected === null ? st !== null : st === null || !privateFile(st) || !sameFile(st, expected)) throw failure(code);
+    };
+    checkOld();
+    const suffix = deps.randomHex(8);
+    if (!/^[0-9a-f]{16}$/.test(suffix)) throw failure(code);
+    const temporary = path.join(dir, `${name}.tmp-${suffix}`);
+    const st = createExclusive(deps, `${kind}-write`, code, temporary, copy);
+    if (st === 'exists' || !privateFile(st)) throw failure(code);
+    const stageId = fileId(st);
+    guarded(code, () => {
+      deps.fault(`${kind}-rename`);
+      checkParent();
+      checkOld();
+      const staged = readProven(temporary, 1n, limit);
+      if (!staged || !privateFile(staged.st) || !sameFile(staged.st, stageId) || !staged.bytes.equals(copy)) throw failure(code);
+      fs.renameSync(temporary, destination);
+    });
+    syncDir(deps, kind === 'ledger' ? 'ledger-dirsync' : 'attempt-rename-dirsync', code, dir);
+    checkParent();
+    const result = readProven(destination, 1n, limit);
+    // The observed rename may change ctime; inode/birthtime and exact staged
+    // bytes still prove this is the new file, never an adopted replacement.
+    if (!result || !privateFile(result.st) || !sameFile(result.st, stageId, true) || !result.bytes.equals(copy)) throw failure(code);
+    return fileId(result.st);
+  });
 }
 
 // ---------------------------------------------------------------- lock records

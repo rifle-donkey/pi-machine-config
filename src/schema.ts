@@ -227,8 +227,8 @@ const TUI_MODES = new Set(['regular', 'fullscreen']);
 
 /**
  * Whether a validated `theme` setting names only built-in themes (`name` or
- * the automatic `light/dark` pair form). Custom names refer to theme files
- * this release cannot validate.
+ * the automatic `light/dark` pair form). Custom names need separate local
+ * theme validation and discovery checks before readiness.
  */
 export function isBuiltinThemeSetting(v: string): boolean {
   return v.split('/').every((n) => BUILTIN_THEMES.has(n));

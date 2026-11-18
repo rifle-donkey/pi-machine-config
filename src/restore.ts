@@ -9,6 +9,8 @@
  * A locked revalidation failure creates no target configuration. The engine may
  * retain its new private state directory without a journal; existing recovery
  * rules classify that as journal-missing rather than adopting or deleting it.
+ * A reserved package-attempt entry instead blocks analysis before journal reads;
+ * it is never adopted, opened or cleared by this service.
  */
 import { isTokenSyntax } from './approval.ts';
 import { failure, invalid } from './errors.ts';
