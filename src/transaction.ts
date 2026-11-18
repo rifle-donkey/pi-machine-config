@@ -803,10 +803,24 @@ function parentStillAt(target: string, expected: DirId): boolean {
 }
 
 /** Recheck canonical locations before opening any target lock or output. */
-function guardRecoveryTargets(j: Journal, live: string[]): void {
+function guardRecoveryTargets(j: Journal, live: string[], classifyPackageDrift = false): void {
   const targets: [string, DirId][] = [[j.targets.agent, j.targets.agentParent]];
   if (j.targets.lens !== null && j.targets.lensParent !== null) targets.push([j.targets.lens, j.targets.lensParent]);
   for (const [target, expected] of targets) {
+    if (classifyPackageDrift) {
+      const parent = path.dirname(target);
+      let real: string;
+      try { real = fs.realpathSync.native(parent); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException | null)?.code;
+        throw failure(code === 'ENOENT' || code === 'ENOTDIR' ? 'package-config-drift' : 'target-changed');
+      }
+      guardPaths([path.join(real, path.basename(target))], live);
+      const st = lstatQuiet(real);
+      if (st === 'error') throw failure('target-changed');
+      if (real !== parent || st === null || !sameDir(st, expected)) throw failure('package-config-drift');
+      continue;
+    }
     const real = resolvedTargetParent(target, expected);
     if (real === null) throw failure('target-changed');
     guardPaths([path.join(real, path.basename(target))], live);
@@ -1282,7 +1296,7 @@ function corruptAnalysis(stateDir: string, reason: string): Analysis {
  * Read-only analysis of a state directory. `ownLock`/`ownGate` let the
  * process that currently holds the writer lock or recovery gate ignore it.
  */
-function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId; pkg?: PackageCapability } = {}, expected?: RestoreTargets): Analysis {
+function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId; pkg?: PackageCapability } = {}, expected?: RestoreTargets, classifyPackageDrift = false): Analysis {
   const uid = deps.uid();
   const dst = lstatQuiet(stateDir);
   if (dst === null || dst === 'error' || !dst.isDirectory() || Number(dst.uid) !== uid || (dst.mode & 0o077n) !== 0n) {
@@ -1374,7 +1388,7 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
   if (expected !== undefined && (expected.agent !== j.targets.agent || expected.lens !== j.targets.lens)) {
     throw failure('target-context-mismatch');
   }
-  guardRecoveryTargets(j, live);
+  guardRecoveryTargets(j, live, classifyPackageDrift);
 
   let boot: string | null | undefined;
   const bootNow = (): string | null => {
@@ -1822,11 +1836,12 @@ function frozenPackages(packages: readonly PackageDecl[]): readonly PackageDecl[
     return copy;
   }));
 }
-function verifyPackageConsent(opts: PackageRunOptions, j: Journal, packages: readonly PackageDecl[]): void {
+function verifyPackageConsent(opts: PackageRunOptions, verifier: PackageRunOptions['verifyLockedPackageIntent'],
+  packageToken: string, j: Journal, packages: readonly PackageDecl[]): void {
   let token: unknown;
-  try { token = opts.verifyLockedPackageIntent(Object.freeze({ tx: j.tx, planToken: j.planToken, packages: frozenPackages(packages) })); }
+  try { token = verifier.call(opts, Object.freeze({ tx: j.tx, planToken: j.planToken, packages: frozenPackages(packages) })); }
   catch { throw failure('package-approval-mismatch'); }
-  if (token !== opts.packageToken) throw failure('package-approval-mismatch');
+  if (token !== packageToken) throw failure('package-approval-mismatch');
 }
 function verifyPackageHistory(ledger: PackageLedger, packages: readonly PackageDecl[]): void {
   let run = -1;
@@ -1839,14 +1854,16 @@ function verifyPackageHistory(ledger: PackageLedger, packages: readonly PackageD
 }
 
 /** Await facts only. Timeout never proves that a child or group stopped. */
-async function packageExitBefore(exit: Promise<PackageExit>, started: number): Promise<PackageExit> {
-  const remaining = 120000 - (performance.now() - started);
+async function packageExitBefore(exit: Promise<PackageExit>, stopDeadline: number, now: () => number): Promise<PackageExit> {
+  const remaining = stopDeadline - now();
   if (remaining <= 0) throw failure('package-stop-unproven');
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([exit, new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(failure('package-stop-unproven')), remaining);
+    const facts = await Promise.race([exit, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(failure('package-stop-unproven')), Math.ceil(remaining));
     })]);
+    if (now() >= stopDeadline) throw failure('package-stop-unproven');
+    return facts;
   } catch { throw failure('package-stop-unproven'); }
   finally { if (timer !== undefined) clearTimeout(timer); }
 }
@@ -1862,8 +1879,9 @@ export async function runPackageAttempts(state: string, tx: string, opts: Packag
   if (typeof executor !== 'function') throw failure('package-executor-unavailable');
   if (!opts.expectedTargets) throw invalid('target-context-required');
   if (typeof tx !== 'string' || !TX_RE.test(tx)) throw invalid('tx-invalid');
-  if (!isTokenSyntax(opts.packageToken)) throw invalid('package-approval-token-invalid');
-  if (typeof opts.verifyLockedPackageIntent !== 'function' || !Array.isArray(opts.protectedRoots)) throw invalid('package-options-invalid');
+  const packageToken = opts.packageToken, verifier = opts.verifyLockedPackageIntent;
+  if (!isTokenSyntax(packageToken)) throw invalid('package-approval-token-invalid');
+  if (typeof verifier !== 'function' || !Array.isArray(opts.protectedRoots)) throw invalid('package-options-invalid');
   const { deps, live, dir, expected } = openState(state, opts);
   let uid: number;
   try { uid = deps.uid(); } catch { throw failure('package-owner-unavailable'); }
@@ -1943,16 +1961,16 @@ export async function runPackageAttempts(state: string, tx: string, opts: Packag
     if (!jr || canonicalJson(parseJournal(jr.bytes)) !== canonicalJson(j)) throw failure('state-corrupt');
     const journalId = fileId(jr.st), journalDigest = sha256Hex(jr.bytes);
     const packages = restoredPackages(j);
-    verifyPackageConsent(opts, j, packages);
+    verifyPackageConsent(opts, verifier, packageToken, j, packages);
     const old = initial.packageLedger;
     if (old) { verifyPackageHistory(old.value, packages); cap.ledger = old.id; workParent = old.value.workParent; }
     const checkCurrent = (): void => {
       checkDirs();
-      const a = analyze(dir, deps, live, { pkg: cap }, expected);
+      const a = analyze(dir, deps, live, { pkg: cap }, expected, retain);
       if (a.j === null || a.j.tx !== tx || a.cls !== 'applied') throw failure('package-config-drift');
       const r = readProven(path.join(dir, JOURNAL_NAME), 1n, MIB);
       if (!r || !sameFile(r.st, journalId) || sha256Hex(r.bytes) !== journalDigest) throw failure('package-config-drift');
-      verifyPackageConsent(opts, a.j, packages);
+      verifyPackageConsent(opts, verifier, packageToken, a.j, packages);
     };
     if (packages.length === 0) { checkCurrent(); release(); return { tx, status: 'completed', attempted: 0, installed: 0, failed: null }; }
     const count = old?.value.nextSeq ?? 0, run = old?.value.runs.length ?? 0;
@@ -1972,7 +1990,7 @@ export async function runPackageAttempts(state: string, tx: string, opts: Packag
       if (entries !== known.size) throw failure('package-work-changed');
     }
     const wide: DirId = { dev: '9'.repeat(20), ino: '9'.repeat(20), birthtimeNs: '9'.repeat(20) };
-    const header = { run, state: 'open' as const, packageToken: opts.packageToken, lock: cap.lock, owner };
+    const header = { run, state: 'open' as const, packageToken, lock: cap.lock, owner };
     const base: PackageLedger = old?.value ?? { schemaVersion: 1, kind: LEDGER_KIND, tool: TOOL_ID, tx, planToken: j.planToken,
       workParent: wide, nextSeq: 0, runs: [], attempts: [] };
     // Preflight every future terminal representation before non-lock writes.
@@ -1981,7 +1999,7 @@ export async function runPackageAttempts(state: string, tx: string, opts: Packag
         work: { name: `w${count + index}-${'f'.repeat(16)}`, id: wide },
         outcome: { code: 'output-limit' as const, exit: { code: null, signal: 'SIGKILL' as const, stdoutBytes: MIB + 1, stderrBytes: MIB + 1 } } }))] });
     for (let index = 0; index < packages.length; index++) attemptBytes({ schemaVersion: 1, kind: ATTEMPT_KIND, tool: TOOL_ID, tx,
-      planToken: j.planToken, packageToken: opts.packageToken, seq: count + index, run, index, source: packageIdentity(packages[index]), owner,
+      planToken: j.planToken, packageToken, seq: count + index, run, index, source: packageIdentity(packages[index]), owner,
       work: { name: `w${count + index}-${'f'.repeat(16)}`, id: wide }, phase: 'config-verified',
       child: { pid: Number.MAX_SAFE_INTEGER, pgid: Number.MAX_SAFE_INTEGER },
       exit: { code: null, signal: 'SIGKILL', stdoutBytes: MIB + 1, stderrBytes: MIB + 1, timedOut: false, overflow: false } });
@@ -2024,7 +2042,7 @@ export async function runPackageAttempts(state: string, tx: string, opts: Packag
       syncDir(deps, 'work-dirsync', 'package-work-changed', wd);
       syncDir(deps, 'work-dirsync', 'package-work-changed', workRoot);
       checkCurrent();
-      let record: AttemptRecord = { schemaVersion: 1, kind: ATTEMPT_KIND, tool: TOOL_ID, tx, planToken: j.planToken, packageToken: opts.packageToken,
+      let record: AttemptRecord = { schemaVersion: 1, kind: ATTEMPT_KIND, tool: TOOL_ID, tx, planToken: j.planToken, packageToken,
         seq, run, index, source, owner, work: { name, id: active.id }, phase: 'intent', child: null, exit: null };
       const content = attemptBytes(record);
       const st = createExclusive(deps, 'attempt-create', 'package-attempt-write-failed', path.join(dir, ATTEMPT_NAME), content);
@@ -2034,31 +2052,42 @@ export async function runPackageAttempts(state: string, tx: string, opts: Packag
       if (!intent || !sameFile(intent.st, fileId(st)) || !intent.bytes.equals(content)) throw failure('package-attempt-unresolved');
       cap.attempt = fileId(intent.st);
       const advance = (next: AttemptRecord): void => {
-        checkDirs(); checkAdvance(record, next);
-        const id = replacePrivate(deps, dir, 'attempt', cap.attempt, attemptBytes(next));
-        cap.attempt = id; record = parseAttempt(attemptBytes(next));
+        checkDirs();
+        const bytes = attemptBytes(next), snapshot = parseAttempt(bytes);
+        checkAdvance(record, snapshot);
+        cap.attempt = replacePrivate(deps, dir, 'attempt', cap.attempt, bytes);
+        record = snapshot;
       };
       checkCurrent();
-      const started = performance.now();
-      let spawned: ReturnType<NonNullable<TxDeps['packageExecutor']>>;
+      let lastTime = -Infinity;
+      const now = (): number => {
+        const time = performance.now();
+        if (!Number.isFinite(time) || time < lastTime) throw failure('package-stop-unproven');
+        return lastTime = time;
+      };
+      const started = now(), installDeadline = started + 120000, stopDeadline = started + 150000;
+      let pid: number, exit: Promise<PackageExit>;
       try {
-        spawned = executor({ source, agentDir: j.targets.agent, timeoutMs: 120000,
+        const spawned = executor({ source, agentDir: j.targets.agent, timeoutMs: 120000, installDeadline, stopDeadline,
           work: { cwd: path.join(wd, 'cwd'), tmp: path.join(wd, 'tmp'), cache: path.join(wd, 'cache'),
             userconfig: path.join(wd, 'userconfig'), globalconfig: path.join(wd, 'globalconfig') } });
-        if (!spawned || !Number.isSafeInteger(spawned.pid) || spawned.pid <= 1 || !(spawned.exit instanceof Promise)) throw failure('package-spawn-unresolved');
+        exit = spawned.exit;
+        if (!(exit instanceof Promise)) throw failure('package-spawn-unresolved');
+        // Observe rejection even when PID validation or spawned publication fails.
+        void exit.catch(() => {});
+        pid = spawned.pid;
+        if (!Number.isSafeInteger(pid) || pid <= 1) throw failure('package-spawn-unresolved');
       } catch { throw failure('package-spawn-unresolved'); }
-      // Observe rejections immediately, including failures before spawned publication.
-      void spawned.exit.catch(() => {});
-      if (observeGroup(spawned.pid) !== 'alive') throw failure('package-spawn-unresolved');
-      try { advance({ ...record, phase: 'spawned', child: { pid: spawned.pid, pgid: spawned.pid } }); }
+      if (observeGroup(pid) !== 'alive') throw failure('package-spawn-unresolved');
+      try { advance({ ...record, phase: 'spawned', child: { pid, pgid: pid } }); }
       catch {
-        await packageExitBefore(spawned.exit, started);
+        await packageExitBefore(exit, stopDeadline, now);
         throw failure('package-attempt-write-failed');
       }
       attempted++;
-      const facts = await packageExitBefore(spawned.exit, started);
+      const facts = await packageExitBefore(exit, stopDeadline, now);
       checkDirs();
-      if (observeGroup(spawned.pid) !== 'esrch') throw failure('package-stop-unproven');
+      if (now() >= stopDeadline || observeGroup(pid) !== 'esrch' || now() >= stopDeadline) throw failure('package-stop-unproven');
       advance({ ...record, phase: 'stopped-proven', exit: facts });
       checkCurrent();
       advance({ ...record, phase: 'config-verified' });

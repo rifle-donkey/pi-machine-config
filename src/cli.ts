@@ -13,11 +13,13 @@ import { capture, captureReview } from './capture.ts';
 import { ToolError, invalid } from './errors.ts';
 import type { GuardContext } from './fsafe.ts';
 import { plan } from './plan.ts';
+import { preflight } from './preflight.ts';
 import { PLATFORMS, type Platform } from './schema.ts';
 import { restoreFromPlan } from './restore.ts';
 import { inspectRestore, resolveRestore, rollbackRestore } from './transaction.ts';
 
 export const USAGE = `Usage:
+  pi-machine-config preflight [--npm-package <abs-dir>] [--pi-package <abs-dir>]
   pi-machine-config capture-review --policy <file> --source-agent <dir> --platform <darwin|linux> [--source-lens-config <file>]
   pi-machine-config capture --policy <file> --source-agent <dir> --platform <darwin|linux> --out <new-dir> --approve-inclusion <token> [--source-lens-config <file>]
   pi-machine-config plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
@@ -35,6 +37,7 @@ export interface CliOutput {
 }
 
 const SPECS: Record<string, { required: string[]; optional: string[]; flags?: string[] }> = {
+  preflight: { required: [], optional: ['npm-package', 'pi-package'] },
   'capture-review': { required: ['policy', 'source-agent', 'platform'], optional: ['source-lens-config'] },
   // A missing approval is reported as `inclusion-approval-required`, not `usage`.
   capture: { required: ['policy', 'source-agent', 'platform', 'out'], optional: ['source-lens-config', 'approve-inclusion'] },
@@ -84,6 +87,10 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
   try {
     if (command === undefined || !Object.hasOwn(SPECS, command)) throw invalid('usage');
     const a = parseArgs(command, rest);
+    if (command === 'preflight') {
+      const r = preflight(a.get('npm-package'), a.get('pi-package'), env, guard);
+      return { code: r.ok ? 0 : 1, stdout: json({ command, ...r }), stderr: '' };
+    }
     if (command === 'capture-review') {
       const r = captureReview({
         policy: a.get('policy') ?? '',

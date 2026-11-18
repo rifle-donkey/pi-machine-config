@@ -100,13 +100,15 @@ function exitFacts(v: unknown, diagnostic: true): PackageExit;
 function exitFacts(v: unknown, diagnostic: boolean): PackageExitFacts | PackageExit {
   const keys = ['code', 'signal', 'stdoutBytes', 'stderrBytes'];
   const o = obj(v, diagnostic ? [...keys, 'timedOut', 'overflow'] : keys);
-  const code = o.code === null ? null : integer(o.code, 0, 255);
-  const signal = o.signal === null ? null : choice(o.signal, ['SIGTERM', 'SIGKILL', 'other'] as const);
+  const rawCode = o.code, rawSignal = o.signal;
+  const code = rawCode === null ? null : integer(rawCode, 0, 255);
+  const signal = rawSignal === null ? null : choice(rawSignal, ['SIGTERM', 'SIGKILL', 'other'] as const);
   if ((code === null) === (signal === null)) bad();
   const out = fresh({ code, signal, stdoutBytes: integer(o.stdoutBytes, 0, MIB + 1), stderrBytes: integer(o.stderrBytes, 0, MIB + 1) });
   if (!diagnostic) return out;
-  if (typeof o.timedOut !== 'boolean' || typeof o.overflow !== 'boolean') bad();
-  return fresh({ ...out, timedOut: o.timedOut, overflow: o.overflow });
+  const timedOut = o.timedOut, overflow = o.overflow;
+  if (typeof timedOut !== 'boolean' || typeof overflow !== 'boolean') bad();
+  return fresh({ ...out, timedOut, overflow });
 }
 function workName(v: unknown, seq: number): string {
   return text(v, new RegExp(`^w${seq}-[0-9a-f]{16}$`));

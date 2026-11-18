@@ -271,12 +271,16 @@ describe('trusted fixture-only package service',{concurrency:false},()=>{
       {pid:4_100_001,exit:Promise.reject(new Error(PRIVATE))};
     await refused(d.run,kind==='invalid-pid'?'package-spawn-unresolved':undefined);await blocked(f);unchanged(f);
   });
-  test('S10: 120s deadline expires under fake timers, never clears unproven exit',{timeout:5000},async t=>{
-    const f=fixture(t,['npm:qa-one']);const clock=t.mock.method(performance,'now',()=>0);
+  test('S10: installer window does not release exclusion; 150s backstop retains unproven exit',{timeout:5000},async t=>{
+    const f=fixture(t,['npm:qa-one']);let now=0;const clock=t.mock.method(performance,'now',()=>now);
     t.mock.timers.enable({apis:['setTimeout']});const c=controlled(t,f);
-    try {await c.ready();let done=false;void c.settled.then(()=>{done=true;});t.mock.timers.tick(119999);
-      await Promise.resolve();assert.equal(done,false);t.mock.timers.tick(2);
-      const result=await c.settled;assert.ok(result.error);fixed(result.error);assert.equal(c.requests[0].timeoutMs,120000);await blocked(f);
+    const tick=(ms:number)=>{now+=ms;t.mock.timers.tick(ms);};
+    try {await c.ready();let done=false;void c.settled.then(()=>{done=true;});
+      const stillWaiting=()=>Promise.race([c.settled.then(()=>false),new Promise<boolean>(yes=>setImmediate(()=>yes(!done)))]);
+      tick(120000);assert.equal(await stillWaiting(),true);
+      tick(29999);assert.equal(await stillWaiting(),true);
+      tick(1);const result=await c.settled;fixed(result.error,'package-stop-unproven');
+      assert.equal(c.requests[0].timeoutMs,120000);await blocked(f);
     } finally {await c.cleanup();t.mock.timers.reset();clock.mock.restore();}
   });
   for(const kind of ['bytes','same-bytes','work-parent','work-child','state'] as const)

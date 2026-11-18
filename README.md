@@ -6,6 +6,7 @@ A private project for portable Pi configuration across macOS and Linux.
 
 - [Status](#status)
 - [Safety rules](#safety-rules)
+- [Prepare tools on a new machine](#prepare-tools-on-a-new-machine)
 - [Capture a bundle and plan a new-target restore](#capture-a-bundle-and-plan-a-new-target-restore)
 - [Apply a fixture restore](#apply-a-fixture-restore)
 - [Inspect, roll back and recover](#inspect-roll-back-and-recover)
@@ -21,9 +22,9 @@ A private project for portable Pi configuration across macOS and Linux.
 
 ## Status
 
-Six fixture-only commands are available: `capture-review`, `capture`, `plan`, `apply`, `rollback` and `recover`. Capture and activation each require their own matching review token. Apply creates a new target from a complete ready plan; rollback and recovery act only on proven owned configuration. Package installation, full resource discovery and real-machine operation remain unavailable. The [implementation plan](docs/plans/portable-config.md) defines the remaining behavior.
+`preflight` reports local tool metadata without running tools. The capture and restoration commands remain fixture-only: `capture-review`, `capture`, `plan`, `apply`, `rollback` and `recover`. Capture and activation each require their own matching review token. Apply creates a new target from a complete ready plan; rollback and recovery act only on proven owned configuration. Package installation, full resource discovery and real-machine operation remain unavailable. The [implementation plan](docs/plans/portable-config.md) defines the remaining behavior.
 
-Every command protects `.pi` and `.pi-lens` under both the account-database home and any absolute `$HOME` selected by Pi, plus `$PI_CODING_AGENT_DIR`. Changing `$HOME` never removes account-home protection. This release therefore works only with fixture directories, not with a live Pi installation. To also catch symlinked aliases of those locations, each command resolves their real paths. That queries path metadata (whether they exist and where symlinks point); it never opens or reads anything inside them.
+Every command protects `.pi` and `.pi-lens` under both the account-database home and any absolute `$HOME` selected by Pi, plus `$PI_CODING_AGENT_DIR`. Changing `$HOME` never removes account-home protection. The restore workflow therefore works only with fixture directories, not with a live Pi installation. To also catch symlinked aliases of those locations, each command resolves their real paths. That queries path metadata (whether they exist and where symlinks point); it never opens or reads anything inside them.
 
 The commands run directly from a checkout with Node's built-in TypeScript support. The checkout pins `@babel/parser` 7.28.5 with a reviewed dependency lockfile; parser-backed extension analysis remains unavailable. Dependency installation must disable lifecycle scripts and never installs captured Pi packages. The commands are tested with Node 26; the intended Node 24 baseline is not yet verified.
 
@@ -39,6 +40,25 @@ The commands run directly from a checkout with Node's built-in TypeScript suppor
 - An approval token identifies what was reviewed. It is not a signature and does not prove who approved it; anyone who can rewrite a bundle can also rewrite its approval record.
 
 Development instructions and document ownership: [AGENTS.md](AGENTS.md).
+
+## Prepare tools on a new machine
+
+Tool installation is separate from configuration restoration. `pi-machine-config` does not install or upgrade Node.js, npm, Pi or GitHub CLI.
+
+1. Install Node.js from the [Node.js downloads page](https://nodejs.org/en/download). Use Node 26 to reproduce the currently tested runtime. Node 24 or newer is the intended baseline; Node 24 has not yet been verified. Use the npm that comes with your Node.js installation, if bundled.
+2. If the machine will run Pi, install Pi using its [official instructions](https://pi.dev/). Do not open an interactive Pi session or log in against the intended new target before restoration. Pi is not required to run the current fixture-only commands.
+3. Install [GitHub CLI](https://cli.github.com/) only if your own workflow needs `gh`. Restoration does not use it or require GitHub login.
+4. In the shell you will use, check the selected paths and versions. Run the Pi and GitHub CLI path checks only if you installed those tools. If a path or version is unexpected, fix the installation or shell search path before proceeding; restoration does not fix it for you.
+
+   ```sh
+   command -v node && node --version
+   command -v npm
+   # Only if installed:
+   command -v pi
+   command -v gh
+   ```
+
+Run `preflight` from the [command reference](#commands) for a Node baseline check and optional npm/Pi manifest reports. The manifest report does not identify the executable selected by your shell. Managed Pi under a protected directory cannot be checked this way. Older Node releases that cannot load the TypeScript CLI must use `node --version`. Do not use `pi --version` as a read-only check: managed Pi can clean up update staging and lock live settings. `npm --version` can read npm configuration. These checks do not enable live restoration or package installation. Use a temporary fixture directory for the restore procedure below.
 
 ## Capture a bundle and plan a new-target restore
 
@@ -86,6 +106,7 @@ Moving target parents can make even terminal inspection refuse. Rollback retains
 Run from the repository root. All paths must be absolute.
 
 ```bash
+node src/cli.ts preflight [--npm-package <abs-dir>] [--pi-package <abs-dir>]
 node src/cli.ts capture-review --policy <file> --source-agent <dir> --platform <darwin|linux> [--source-lens-config <file>]
 node src/cli.ts capture --policy <file> --source-agent <dir> --platform <darwin|linux> --out <new-dir> --approve-inclusion <token> [--source-lens-config <file>]
 node src/cli.ts plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
@@ -94,6 +115,8 @@ node src/cli.ts rollback --state-dir <dir> --target-agent <dir> --tx <id> [--len
 node src/cli.ts recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
 node src/cli.ts recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
 ```
+
+`preflight` uses the running Node version. Each optional package argument specifies a directory containing that tool's `package.json`. It reads only that manifest, up to 64 KiB, and rejects protected locations, symlinked inputs and hard-linked manifests. It does not run, install or approve tools. Omit a package argument to skip that check.
 
 `capture-review` and `capture` options:
 
@@ -129,6 +152,8 @@ Supplied paths may have symlinked ancestors; the supplied path itself must not b
 | `2` | Invalid input or invocation | Error on stderr |
 
 Errors are `{"ok":false,"error":"<code>"}`, sometimes with a `layer` field. Output contains approved relative item paths and transaction IDs, never configuration values, rejected input, absolute paths, file contents or subprocess output. `capture-review` and a successful `capture` report per-layer counts and how many unlisted settings keys and supported packages were skipped; `capture-review` also prints `captureReviewToken`.
+
+`preflight` reports `node.version` and `node.status` (`baseline-met` or `below-baseline`). Each package result has a `status` (`not-checked`, `reported`, `missing`, `invalid`, or `protected-location`) and a validated `version` or `null`. Pi also reports `discoveryModel` and `modelStatus` (`match`, `discovery-model-stale`, or `null`). A stale discovery model is informational. The report goes to stdout with exit 0 if Node meets the baseline and all requested manifests are reported, or exit 1 otherwise. Invalid arguments exit 2 on stderr; failure to determine protected roots exits 1 on stderr.
 
 Codes you may need to act on:
 

@@ -40,6 +40,9 @@ export interface PackageSpawnSpec {
   readonly source: string;
   readonly agentDir: string;
   readonly timeoutMs: 120000;
+  /** Absolute deadlines on the performance.now() clock. */
+  readonly installDeadline: number;
+  readonly stopDeadline: number;
   readonly work: Readonly<{ cwd: string; tmp: string; cache: string; userconfig: string; globalconfig: string }>;
 }
 export type PackageExecutor = (spec: PackageSpawnSpec) => {
