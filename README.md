@@ -9,6 +9,7 @@ A private project for portable Pi configuration across macOS and Linux.
 - [Prepare tools on a new machine](#prepare-tools-on-a-new-machine)
 - [Capture a bundle and plan a new-target restore](#capture-a-bundle-and-plan-a-new-target-restore)
 - [Apply a fixture restore](#apply-a-fixture-restore)
+- [Verify a fixture restore](#verify-a-fixture-restore)
 - [Inspect, roll back and recover](#inspect-roll-back-and-recover)
 - [Reference](#reference)
   - [Commands](#commands)
@@ -22,7 +23,7 @@ A private project for portable Pi configuration across macOS and Linux.
 
 ## Status
 
-`preflight` reports local tool metadata without running tools. The capture and restoration commands remain fixture-only: `capture-review`, `capture`, `plan`, `apply`, `rollback` and `recover`. Capture and activation each require their own matching review token. Apply creates a new target from a complete ready plan; rollback and recovery act only on proven owned configuration. Package installation, full resource discovery and real-machine operation remain unavailable. The [implementation plan](docs/plans/portable-config.md) defines the remaining behavior.
+`preflight` reports local tool metadata without running tools. The capture and restoration commands remain fixture-only: `capture-review`, `capture`, `plan`, `apply`, `doctor`, `rollback` and `recover`. Capture and activation each require their own matching review token. Apply creates a new target from a complete ready plan; rollback and recovery act only on proven owned configuration. Package installation, full resource discovery and real-machine operation remain unavailable. The [implementation plan](docs/plans/portable-config.md) defines the remaining behavior.
 
 Every command protects `.pi` and `.pi-lens` under both the account-database home and any absolute `$HOME` selected by Pi, plus `$PI_CODING_AGENT_DIR`. Changing `$HOME` never removes account-home protection. The restore workflow therefore works only with fixture directories, not with a live Pi installation. To also catch symlinked aliases of those locations, each command resolves their real paths. That queries path metadata (whether they exist and where symlinks point); it never opens or reads anything inside them.
 
@@ -79,6 +80,14 @@ Run `preflight` from the [command reference](#commands) for a Node baseline chec
 
 Only a `ready` plan can activate. Incomplete schema, dependency or resource checks still block application. This does not make unimplemented adapters available or authorize a real restore.
 
+## Verify a fixture restore
+
+After `apply`, run `doctor` with the same bundle, platform, target, state directory and any overlay or lens path, plus the transaction ID returned by `apply`. See [Commands](#commands). Keep other restore operations stopped while checking. This is a read-only check at the time of inspection, not a guarantee against later changes.
+
+- `match`: Tracked restored configuration matches the supplied intent. This does not check extra files, installed packages or Pi startup readiness.
+- `mismatch`: The applied transaction is proven, but its intent does not match the supplied inputs or the current tool's intent model.
+- `unverified`: The check could not establish a match. Possible reasons include an existing lock, changed or missing tracked files, or an incomplete intent. Doctor never judges or clears a lock.
+
 ## Inspect, roll back and recover
 
 1. Use `recover --inspect` with the original state path, `--target-agent` and, when present, `--lens-config`. The target context must match the private journal before any target access. Inspection is read-only and never breaks locks.
@@ -111,6 +120,7 @@ node src/cli.ts capture-review --policy <file> --source-agent <dir> --platform <
 node src/cli.ts capture --policy <file> --source-agent <dir> --platform <darwin|linux> --out <new-dir> --approve-inclusion <token> [--source-lens-config <file>]
 node src/cli.ts plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
 node src/cli.ts apply --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> --state-dir <new-dir> --approve-activation <token> [--overlay <dir>] [--lens-config <new-file>]
+node src/cli.ts doctor --bundle <dir> --platform <darwin|linux> --target-agent <dir> --state-dir <dir> --tx <id> [--overlay <dir>] [--lens-config <file>]
 node src/cli.ts rollback --state-dir <dir> --target-agent <dir> --tx <id> [--lens-config <file>]
 node src/cli.ts recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
 node src/cli.ts recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
@@ -154,6 +164,8 @@ Supplied paths may have symlinked ancestors; the supplied path itself must not b
 Errors are `{"ok":false,"error":"<code>"}`, sometimes with a `layer` field. Output contains approved relative item paths and transaction IDs, never configuration values, rejected input, absolute paths, file contents or subprocess output. `capture-review` and a successful `capture` report per-layer counts and how many unlisted settings keys and supported packages were skipped; `capture-review` also prints `captureReviewToken`.
 
 `preflight` reports `node.version` and `node.status` (`baseline-met` or `below-baseline`). Each package result has a `status` (`not-checked`, `reported`, `missing`, `invalid`, or `protected-location`) and a validated `version` or `null`. Pi also reports `discoveryModel` and `modelStatus` (`match`, `discovery-model-stale`, or `null`). A stale discovery model is informational. The report goes to stdout with exit 0 if Node meets the baseline and all requested manifests are reported, or exit 1 otherwise. Invalid arguments exit 2 on stderr; failure to determine protected roots exits 1 on stderr.
+
+`doctor` returns one JSON report on stdout: `ok`, `command`, `status`, and `reason` on failure. `match` exits 0; `mismatch` and `unverified` exit 1. Invalid arguments or inputs exit 2 on stderr. Unexpected failures exit 1 on stderr with `internal-error`. The report does not expose transaction IDs, tokens, digests or configuration values.
 
 Codes you may need to act on:
 

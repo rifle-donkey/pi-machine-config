@@ -15,6 +15,8 @@ export interface AppliedPlanOptions extends PlanOptions {
   tx: string;
   /** Internal deterministic test seam, never set through CLI or environment. */
   deps?: Partial<TxDeps>;
+  /** Doctor checks lock presence without judging its owner. */
+  lockPolicy?: 'presence';
 }
 export interface AppliedPlan {
   prepared: PreparedPlan;
@@ -23,7 +25,7 @@ export interface AppliedPlan {
 
 export function auditAppliedPlan(opts: AppliedPlanOptions): AppliedPlan {
   const snapshot = readAppliedRestore(opts.stateDir, opts.tx, {
-    env: opts.env, guard: opts.guard, deps: opts.deps,
+    env: opts.env, guard: opts.guard, deps: opts.deps, lockPolicy: opts.lockPolicy,
     expectedTargets: { agent: opts.targetAgent, lens: opts.lensConfig ?? null },
   });
   const prepared = preparePlan(opts);

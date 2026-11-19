@@ -9,6 +9,7 @@
  */
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { auditAppliedPlan } from './applied-plan.ts';
 import { capture, captureReview } from './capture.ts';
 import { ToolError, invalid } from './errors.ts';
 import type { GuardContext } from './fsafe.ts';
@@ -24,6 +25,7 @@ export const USAGE = `Usage:
   pi-machine-config capture --policy <file> --source-agent <dir> --platform <darwin|linux> --out <new-dir> --approve-inclusion <token> [--source-lens-config <file>]
   pi-machine-config plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
   pi-machine-config apply --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> --state-dir <new-dir> --approve-activation <token> [--overlay <dir>] [--lens-config <new-file>]
+  pi-machine-config doctor --bundle <dir> --platform <darwin|linux> --target-agent <dir> --state-dir <dir> --tx <id> [--overlay <dir>] [--lens-config <file>]
   pi-machine-config rollback --state-dir <dir> --target-agent <dir> --tx <id> [--lens-config <file>]
   pi-machine-config recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
   pi-machine-config recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
@@ -43,6 +45,7 @@ const SPECS: Record<string, { required: string[]; optional: string[]; flags?: st
   capture: { required: ['policy', 'source-agent', 'platform', 'out'], optional: ['source-lens-config', 'approve-inclusion'] },
   plan: { required: ['bundle', 'platform', 'target-agent'], optional: ['overlay', 'lens-config'] },
   apply: { required: ['bundle', 'platform', 'target-agent', 'state-dir'], optional: ['overlay', 'lens-config', 'approve-activation'] },
+  doctor: { required: ['bundle', 'platform', 'target-agent', 'state-dir', 'tx'], optional: ['overlay', 'lens-config'] },
   rollback: { required: ['state-dir', 'target-agent', 'tx'], optional: ['lens-config'] },
   recover: { required: ['state-dir', 'target-agent'], optional: ['lens-config', 'tx', 'expect', 'action'], flags: ['inspect', 'resolve'] },
 };
@@ -130,6 +133,14 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
       });
       return { code: 0, stdout: json({ ok: true, command, ...r }), stderr: '' };
     }
+    if (command === 'doctor') {
+      auditAppliedPlan({
+        bundle: a.get('bundle') ?? '', platform: platformArg(a.get('platform')),
+        targetAgent: a.get('target-agent') ?? '', stateDir: a.get('state-dir') ?? '', tx: a.get('tx') ?? '',
+        overlay: a.get('overlay'), lensConfig: a.get('lens-config'), env, guard, lockPolicy: 'presence',
+      });
+      return { code: 0, stdout: json({ ok: true, command, status: 'match' }), stderr: '' };
+    }
     if (command === 'recover') {
       if (a.has('inspect') === a.has('resolve')) throw invalid('usage');
       const mutation = ['tx', 'expect', 'action'];
@@ -151,6 +162,10 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
     return { code: 0, stdout: json({ ok: true, command, tx: r.tx, action: r.action, previousClass: r.class, removed: r.removed }), stderr: '' };
   } catch (e) {
     if (e instanceof ToolError) {
+      if (command === 'doctor' && e.exit === 1) {
+        const status = e.code === 'restore-intent-mismatch' ? 'mismatch' : 'unverified';
+        return { code: 1, stdout: json({ ok: false, command, status, reason: e.code }), stderr: '' };
+      }
       const body: Record<string, unknown> = { ok: false, error: e.code };
       if (e.layer !== undefined) body.layer = e.layer;
       return { code: e.exit, stdout: '', stderr: json(body) };

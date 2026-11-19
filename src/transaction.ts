@@ -131,7 +131,7 @@ import {
   type AbsentTarget,
   type GuardContext,
 } from './fsafe.ts';
-import { canonicalJson, isObject, parseJsonBytes, prettyJson, type JsonObject, type JsonValue } from './json.ts';
+import { canonicalJson, isObject, parseJsonBytes, type JsonObject, type JsonValue } from './json.ts';
 import {
   LIMITS,
   MIB,
@@ -1296,7 +1296,7 @@ function corruptAnalysis(stateDir: string, reason: string): Analysis {
  * Read-only analysis of a state directory. `ownLock`/`ownGate` let the
  * process that currently holds the writer lock or recovery gate ignore it.
  */
-function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId; pkg?: PackageCapability } = {}, expected?: RestoreTargets, classifyPackageDrift = false): Analysis {
+function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: FileId; gate?: FileId; pkg?: PackageCapability } = {}, expected?: RestoreTargets, classifyPackageDrift = false, lockPolicy: 'judge' | 'presence' = 'judge'): Analysis {
   const uid = deps.uid();
   const dst = lstatQuiet(stateDir);
   if (dst === null || dst === 'error' || !dst.isDirectory() || Number(dst.uid) !== uid || (dst.mode & 0o077n) !== 0n) {
@@ -1314,7 +1314,7 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
   }
   // Recognizable package locks never reach ordinary stale-owner judging. A
   // damaged/unreadable lock still fails the existing unproven-lock path.
-  const packageLock = readProven(path.join(stateDir, LOCK_NAME), 1n, LOCK_LIMIT);
+  const packageLock = lockPolicy === 'judge' ? readProven(path.join(stateDir, LOCK_NAME), 1n, LOCK_LIMIT) : null;
   let isPackageLock = false;
   if (packageLock) {
     try {
@@ -1395,14 +1395,19 @@ function analyze(stateDir: string, deps: TxDeps, live: string[], own: { lock?: F
     if (boot === undefined) boot = bootIdOf(deps);
     return boot;
   };
-  const gate = observeLock(path.join(stateDir, GATE_NAME), 'gate', j.tx, deps, bootNow, own.gate ?? null, 'any');
-  const stateLock = observeLock(path.join(stateDir, LOCK_NAME), 'state', j.tx, deps, bootNow, own.pkg?.lock ?? own.lock ?? null, 'any');
+  const lock = (file: string, role: LockRole, held: FileId | null, proven: FileId | null | 'any'): LockObs => {
+    if (lockPolicy === 'judge') return observeLock(file, role, j.tx, deps, bootNow, held, proven);
+    const absent = lstatQuiet(file) === null;
+    return { file, state: absent ? 'absent' : 'held', record: null, id: null, reason: absent ? null : 'lock-presence-unverified' };
+  };
+  const gate = lock(path.join(stateDir, GATE_NAME), 'gate', own.gate ?? null, 'any');
+  const stateLock = lock(path.join(stateDir, LOCK_NAME), 'state', own.pkg?.lock ?? own.lock ?? null, 'any');
   const tlFile = path.join(j.targets.agent, TARGET_LOCK_NAME);
   const rootOk = j.root.phase === 'created' && j.root.id !== null && sameDirAt(j.targets.agent, j.root.id);
   let targetLock: LockObs = { state: 'absent', reason: null, record: null, id: null, file: tlFile };
   if (rootOk) {
     const proven = j.targetLock.phase === 'held' || j.targetLock.phase === 'released' ? j.targetLock.id : null;
-    targetLock = observeLock(tlFile, 'target', j.tx, deps, bootNow, null, proven);
+    targetLock = lock(tlFile, 'target', null, proven);
   }
 
   const root = TERMINAL.has(j.status) ? OBS('terminal') : observeRoot(j);
@@ -1514,11 +1519,12 @@ export interface AppliedRestoreSnapshot {
 }
 
 /** Read-only trusted service; caller must explicitly bind both target roots. */
-export function readAppliedRestore(state: string, tx: string, opts: TxOptions & { expectedTargets: RestoreTargets }): AppliedRestoreSnapshot {
+export function readAppliedRestore(state: string, tx: string,
+  opts: TxOptions & { expectedTargets: RestoreTargets; lockPolicy?: 'presence' }): AppliedRestoreSnapshot {
   if (opts.expectedTargets === undefined) throw invalid('target-context-required');
   const { deps, live, dir, expected } = openState(state, opts);
   if (typeof tx !== 'string' || !TX_RE.test(tx)) throw invalid('tx-invalid');
-  const a = analyze(dir, deps, live, {}, expected);
+  const a = analyze(dir, deps, live, {}, expected, false, opts.lockPolicy);
   if (a.j === null) throw failure('state-corrupt');
   if (a.j.tx !== tx) throw failure('tx-mismatch');
   if (a.cls !== 'applied') throw failure('restore-not-applied');

@@ -189,7 +189,7 @@ export function preparePlan(opts: PlanOptions): PreparedPlan {
     items.push({ kind: 'package', source: typeof d === 'string' ? d : d.source, operation: 'activation-required' });
   }
 
-  const home = os.userInfo().homedir;
+  const home = opts.guard?.home ?? os.userInfo().homedir;
   const rendered: RenderedFile[] = [];
   const files: PreparedFile[] = [];
   for (const { record, bytes } of merged.files) {
