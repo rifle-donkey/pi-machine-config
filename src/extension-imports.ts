@@ -36,7 +36,11 @@ function classify(file: string, kind: Kind, typeOnly: boolean, literal: unknown,
   const edge = { kind, typeOnly };
   if (!isNode(literal) || literal.type !== 'StringLiteral' || typeof literal.value !== 'string') return { ...edge, status: 'unsupported' };
   const spec = literal.value;
-  if (!spec.startsWith('./') && !spec.startsWith('../')) return { ...edge, status: 'external' };
+  if (!spec.startsWith('./') && !spec.startsWith('../')) {
+    const unsupported = spec === '.' || spec === '..' || /^[/#]/.test(spec) ||
+      (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(spec) && !spec.startsWith('node:'));
+    return { ...edge, status: unsupported ? 'unsupported' : 'external' };
+  }
   if (/[\\?#%\x00-\x1f\x7f-\x9f]/.test(spec) || spec.split('/').some(part => part === '')) return { ...edge, status: 'unsupported' };
   const target = posix.join(posix.dirname(file), spec);
   if (!target.startsWith('extensions/')) return { ...edge, status: 'outside-set' };

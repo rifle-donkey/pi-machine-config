@@ -88,6 +88,8 @@ After `apply`, run `doctor` with the same bundle, platform, target, state direct
 - `mismatch`: The applied transaction is proven, but its intent does not match the supplied inputs or the current tool's intent model.
 - `unverified`: The check could not establish a match. Possible reasons include an existing lock, changed or missing tracked files, or an incomplete intent. Doctor never judges or clears a lock.
 
+To diagnose imports before restoring, use `doctor --extension-imports` with the bundle and planning paths. It checks only the selected bundle payloads, not the installed target. It reports exact import counts without executing extensions or changing plan readiness. For bundle skill and tool configuration diagnostics, use `doctor --resource-checks` with the same planning paths.
+
 ## Inspect, roll back and recover
 
 1. Use `recover --inspect` with the original state path, `--target-agent` and, when present, `--lens-config`. The target context must match the private journal before any target access. Inspection is read-only and never breaks locks.
@@ -121,6 +123,8 @@ node src/cli.ts capture --policy <file> --source-agent <dir> --platform <darwin|
 node src/cli.ts plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
 node src/cli.ts apply --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> --state-dir <new-dir> --approve-activation <token> [--overlay <dir>] [--lens-config <new-file>]
 node src/cli.ts doctor --bundle <dir> --platform <darwin|linux> --target-agent <dir> --state-dir <dir> --tx <id> [--overlay <dir>] [--lens-config <file>]
+node src/cli.ts doctor --extension-imports --bundle <dir> --platform <darwin|linux> --target-agent <dir> [--overlay <dir>] [--lens-config <file>]
+node src/cli.ts doctor --resource-checks --bundle <dir> --platform <darwin|linux> --target-agent <dir> [--overlay <dir>] [--lens-config <file>]
 node src/cli.ts rollback --state-dir <dir> --target-agent <dir> --tx <id> [--lens-config <file>]
 node src/cli.ts recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
 node src/cli.ts recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
@@ -166,6 +170,14 @@ Errors are `{"ok":false,"error":"<code>"}`, sometimes with a `layer` field. Outp
 `preflight` reports `node.version` and `node.status` (`baseline-met` or `below-baseline`). Each package result has a `status` (`not-checked`, `reported`, `missing`, `invalid`, or `protected-location`) and a validated `version` or `null`. Pi also reports `discoveryModel` and `modelStatus` (`match`, `discovery-model-stale`, or `null`). A stale discovery model is informational. The report goes to stdout with exit 0 if Node meets the baseline and all requested manifests are reported, or exit 1 otherwise. Invalid arguments exit 2 on stderr; failure to determine protected roots exits 1 on stderr.
 
 `doctor` returns one JSON report on stdout: `ok`, `command`, `status`, and `reason` on failure. `match` exits 0; `mismatch` and `unverified` exit 1. Invalid arguments or inputs exit 2 on stderr. Unexpected failures exit 1 on stderr with `internal-error`. The report does not expose transaction IDs, tokens, digests or configuration values.
+
+In extension-import mode, `doctor` adds `mode: "extension-imports"`. `complete` exits 0 with file reports even when imports are unresolved. `unverified` exits 1 with a fixed reason and no file reports. Analysis results must arrive within the two-second worker deadline; worker cleanup can take longer. This mode uses the project-local locked parser and never accepts `--state-dir` or `--tx`.
+
+Resource-check mode adds `mode: "resource-checks"`. It rejects `--state-dir`, `--tx` and `--extension-imports`. It checks only the final rendered bundle resources without reading installed resource contents or changing restore readiness. `complete` exits 0 and returns `skillMetadata`, `skillDiscovery` and path-sorted `toolConfigs`, even if individual checks fail. `skillMetadata.missingEntries` counts skill directories without their top-level entry file (`skills/<directory>/SKILL.md`). `skillDiscovery.nameCheck: "complete"` covers only the supplied bundle payloads, not installed, project or package skills. The tool checks recognize documented subsets of `keybindings.json`, `dev-kit/models.json` and `herdr-agents/config.json`; they do not prove runtime compatibility. `unverified` exits 1 without partial reports. `analysis-limit` means a skill analysis limit was reached; `skill-namespace-conflict` means the merged skill paths conflict.
+
+Each extension file report has a bundle-relative `path` and a `status`. `analyzed` adds an `imports` object with counts for `resolved`, `missing`, `outside-set`, `unsupported`, `unsupported-target`, and `external`. `external` does not prove a package dependency. `not-module` has no counts. `failed` has a `reason`: `decode-error`, `parse-error`, `parse-limit`, `import-limit`, or `node-limit`.
+
+An `unverified` extension report may carry `analysis-limit` (input or report bounds exceeded), `analysis-timeout`, `analyzer-unavailable` (the local parser could not load), or `analysis-failed` (the worker failed or returned an invalid result). Bundle preparation can also return its usual error codes.
 
 Codes you may need to act on:
 

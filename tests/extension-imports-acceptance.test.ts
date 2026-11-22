@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { pathToFileURL } from 'node:url';
+import workerThreads from 'node:worker_threads';
 import { ToolError } from '../src/errors.ts';
 import type { Platform } from '../src/schema.ts';
 
@@ -161,7 +162,10 @@ test('analyzer: relative matching is lexical, exact, case sensitive and bounded 
   const analyze = await analyzer();
   const specifiers = [
     './inside/../value.ts', '../asset.JSON', '././value.ts', './Value.ts', './value', './value.js', './dir',
-    './note.md', '../../outside-fixture.ts', 'fixture-package/submodule', 'node:path', '/fixture-only.ts',
+    './note.md', '../../outside-fixture.ts', 'fixture-package/submodule', 'node:path', '@fixture/scope',
+    '.', '..', '/fixture-only.ts', '//fixture-only.ts', '#fixture-alias',
+    'file:fixture.ts', 'https://fixture.invalid/a', 'git+ssh://fixture.invalid/a', 'x1.0-fixture:a', 'data:text/plain,a',
+    'Node:path', 'node+fixture:path', 'C:\\fixture-only.ts',
     './value.ts?fixture-query', './value.ts#fixture-fragment', './value%2Ets', './inside//../value.ts', './dir/',
     './inside\\value.ts', './fixture\u0000value.ts',
   ];
@@ -177,7 +181,7 @@ test('analyzer: relative matching is lexical, exact, case sensitive and bounded 
       ...Array.from({ length: 4 }, () => edge('static', 'missing')),
       edge('static', 'unsupported-target'), edge('static', 'outside-set'),
       ...Array.from({ length: 3 }, () => edge('static', 'external')),
-      ...Array.from({ length: 7 }, () => edge('static', 'unsupported'))),
+      ...Array.from({ length: 20 }, () => edge('static', 'unsupported'))),
     notModule(note), failed(target, 'parse-error'),
   ));
 });
@@ -335,9 +339,14 @@ test('analyzer: refuses ancestor Babel fallback when the copied project has no l
   assert.deepEqual(attempts, []);
 });
 
-test('public baseline: parser-free plan/CLI keep extension bundles incomplete and refuse apply without writes', async (t) => {
+test('public baseline: parser-free defaults never start a worker and keep plan, apply and transaction doctor unchanged', async (t) => {
   const { root, modules } = copiedApp(t);
   const attempted: string[] = [];
+  const worker = t.mock.method(workerThreads, 'Worker', function unexpectedWorker() {
+    attempted.push('worker construction');
+    throw new Error('fixture unexpected worker');
+  });
+  syncBuiltinESMExports();
   const hooks = registerHooks({
     resolve(specifier, context, next) {
       if (specifier.includes('extension-imports') || specifier.includes('@babel/parser')) {
@@ -350,7 +359,8 @@ test('public baseline: parser-free plan/CLI keep extension bundles incomplete an
   try {
     const { captureReview, capture }: typeof import('../src/capture.ts') = await import(new URL('capture.ts', modules).href);
     const { plan }: typeof import('../src/plan.ts') = await import(new URL('plan.ts', modules).href);
-    const { main }: typeof import('../src/cli.ts') = await import(new URL('cli.ts', modules).href);
+    const cli: typeof import('../src/cli.ts') = await import(new URL('cli.ts', modules).href);
+    const { main } = cli;
     const home = path.join(root, 'home');
     const sourceAgent = path.join(root, 'source');
     const targetAgent = path.join(root, 'target');
@@ -386,19 +396,61 @@ test('public baseline: parser-free plan/CLI keep extension bundles incomplete an
     assert.equal(preview.code, 1);
     assert.equal(preview.stderr, '');
     assert.deepEqual(JSON.parse(preview.stdout), { ok: false, command: 'plan', ...expected });
-    const apply = main(['apply', ...args, '--state-dir', state, '--approve-activation', `sha256:${'0'.repeat(64)}`], env, guard);
+    const applyArgs = ['apply', ...args, '--state-dir', state, '--approve-activation', `sha256:${'0'.repeat(64)}`];
+    const apply = main(applyArgs, env, guard);
     assert.equal(apply.code, 1);
     assert.equal(apply.stdout, '');
     assert.deepEqual(JSON.parse(apply.stderr), { ok: false, error: 'plan-not-ready' });
     assert.equal(fs.existsSync(targetAgent), false);
     assert.equal(fs.existsSync(state), false);
-    assert.doesNotMatch(main(['help'], env, guard).stdout, /extension-imports/);
     const unsupported = main(['extension-imports'], env, guard);
     assert.equal(unsupported.code, 2);
     assert.equal(unsupported.stdout, '');
     assert.deepEqual(JSON.parse(unsupported.stderr), { ok: false, error: 'usage' });
+
+    // Make a separate ready restore in the parser-free project. Setup uses fake
+    // boot and owner observations; the ordinary doctor must not need them.
+    fs.writeFileSync(path.join(sourceAgent, 'AGENTS.md'), 'Inert fixture instructions.\n');
+    fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, kind: 'pi-machine-config/inclusion', layers: { common: {
+      files: [{ root: 'agent', path: 'AGENTS.md', class: 'agent-context', template: false }],
+    } } }));
+    const plainBundle = path.join(root, 'plain-bundle');
+    capture({ ...opts, out: plainBundle, approveInclusion: captureReview(opts).captureReviewToken });
+    const plain = { bundle: plainBundle, targetAgent, platform, env, guard };
+    const ready = plan(plain);
+    assert.equal(ready.status, 'ready');
+    assert.ok(ready.approvalToken);
+    const { restoreFromPlan }: typeof import('../src/restore.ts') = await import(new URL('restore.ts', modules).href);
+    const applied = restoreFromPlan({ ...plain, stateDir: state, approveActivation: ready.approvalToken,
+      deps: { platform, bootId: () => '11111111-2222-4333-8444-555555555555', hostname: () => 'fixture-host',
+        uid: () => process.getuid?.() ?? 0, pid: () => 4000201, probePid: () => assert.fail('unexpected PID query') } });
+    assert.equal(applied.status, 'applied');
+    const doctorArgs = ['doctor', '--bundle', plainBundle, '--target-agent', targetAgent, '--platform', platform,
+      '--state-dir', state, '--tx', applied.tx];
+    const match = { code: 0, stdout: '{"ok":true,"command":"doctor","status":"match"}\n', stderr: '' };
+    assert.deepEqual(main(doctorArgs, env, guard), match);
+
+    const runCli: unknown = Reflect.get(cli, 'runCli');
+    assert.equal(typeof runCli, 'function', 'missing feature: runCli');
+    const dispatch = runCli as (...args: Parameters<typeof main>) => Promise<ReturnType<typeof main>>;
+    const help = main(['help'], env, guard);
+    assert.deepEqual(help.stdout.split('\n').filter((l) => l.includes('extension-imports')), [
+      '  pi-machine-config doctor --extension-imports --bundle <dir> --platform <darwin|linux> --target-agent <dir> [--overlay <dir>] [--lens-config <file>]',
+    ]);
+    assert.deepEqual(await dispatch(['help'], env, guard), help);
+    assert.deepEqual(await dispatch(['extension-imports'], env, guard), unsupported);
+    // Compare with the pre-restore default results against fresh paths.
+    const anotherTarget = path.join(root, 'another-target');
+    const anotherState = path.join(root, 'another-state');
+    assert.deepEqual(await dispatch(['plan', ...args.map((x) => x === targetAgent ? anotherTarget : x)], env, guard), preview);
+    assert.deepEqual(await dispatch(applyArgs.map((x) => x === targetAgent ? anotherTarget : x === state ? anotherState : x), env, guard), apply);
+    assert.equal(fs.existsSync(anotherTarget), false);
+    assert.equal(fs.existsSync(anotherState), false);
+    assert.deepEqual(await dispatch(doctorArgs, env, guard), match);
   } finally {
     hooks.deregister();
+    worker.mock.restore();
+    syncBuiltinESMExports();
+    assert.deepEqual(attempted, []);
   }
-  assert.deepEqual(attempted, []);
 });

@@ -26,6 +26,8 @@ export const USAGE = `Usage:
   pi-machine-config plan --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> [--overlay <dir>] [--lens-config <new-file>]
   pi-machine-config apply --bundle <dir> --platform <darwin|linux> --target-agent <new-dir> --state-dir <new-dir> --approve-activation <token> [--overlay <dir>] [--lens-config <new-file>]
   pi-machine-config doctor --bundle <dir> --platform <darwin|linux> --target-agent <dir> --state-dir <dir> --tx <id> [--overlay <dir>] [--lens-config <file>]
+  pi-machine-config doctor --extension-imports --bundle <dir> --platform <darwin|linux> --target-agent <dir> [--overlay <dir>] [--lens-config <file>]
+  pi-machine-config doctor --resource-checks --bundle <dir> --platform <darwin|linux> --target-agent <dir> [--overlay <dir>] [--lens-config <file>]
   pi-machine-config rollback --state-dir <dir> --target-agent <dir> --tx <id> [--lens-config <file>]
   pi-machine-config recover --state-dir <dir> --target-agent <dir> --inspect [--lens-config <file>]
   pi-machine-config recover --state-dir <dir> --target-agent <dir> --resolve --tx <id> --expect <class> --action <action> [--lens-config <file>]
@@ -50,8 +52,7 @@ const SPECS: Record<string, { required: string[]; optional: string[]; flags?: st
   recover: { required: ['state-dir', 'target-agent'], optional: ['lens-config', 'tx', 'expect', 'action'], flags: ['inspect', 'resolve'] },
 };
 
-function parseArgs(command: string, args: string[]): Map<string, string> {
-  const spec = SPECS[command];
+function parseArgs(spec: (typeof SPECS)[string], args: string[]): Map<string, string> {
   const out = new Map<string, string>();
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
@@ -89,7 +90,7 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
   if (command === '--help' || command === 'help') return { code: 0, stdout: USAGE, stderr: '' };
   try {
     if (command === undefined || !Object.hasOwn(SPECS, command)) throw invalid('usage');
-    const a = parseArgs(command, rest);
+    const a = parseArgs(SPECS[command], rest);
     if (command === 'preflight') {
       const r = preflight(a.get('npm-package'), a.get('pi-package'), env, guard);
       return { code: r.ok ? 0 : 1, stdout: json({ command, ...r }), stderr: '' };
@@ -174,6 +175,35 @@ export function main(argv: string[], env: Record<string, string | undefined> = p
   }
 }
 
+/** Executable dispatch; load opt-in diagnostics only when selected. */
+export async function runCli(argv: string[], env: Record<string, string | undefined> = process.env,
+  guard?: GuardContext): Promise<CliOutput> {
+  const [command, ...rest] = argv;
+  if (command !== 'doctor') return main(argv, env, guard);
+  let mode: 'extension-imports' | 'resource-checks' = 'extension-imports';
+  try {
+    const a = parseArgs({ required: ['bundle', 'platform', 'target-agent'],
+      optional: ['overlay', 'lens-config', 'state-dir', 'tx'], flags: ['extension-imports', 'resource-checks'] }, rest);
+    const extensions = a.has('extension-imports'), resources = a.has('resource-checks');
+    if (!extensions && !resources) return main(argv, env, guard);
+    if ((extensions && resources) || a.has('tx') || a.has('state-dir')) throw invalid('usage');
+    if (resources) mode = 'resource-checks';
+    const opts = { bundle: a.get('bundle')!, platform: platformArg(a.get('platform')), targetAgent: a.get('target-agent')!,
+      overlay: a.get('overlay'), lensConfig: a.get('lens-config'), env, guard };
+    const report = resources ? (await import('./doctor-resources.ts')).diagnoseBundleResources(opts) :
+      await (await import('./doctor-extensions.ts')).diagnoseBundleExtensions(opts);
+    const ok = report.status === 'complete';
+    return { code: ok ? 0 : 1, stdout: json({ ok, command, mode, ...report }), stderr: '' };
+  } catch (e) {
+    if (e instanceof ToolError) {
+      if (e.exit === 1) return { code: 1, stdout: json({ ok: false, command, mode,
+        status: 'unverified', reason: e.code }), stderr: '' };
+      return { code: e.exit, stdout: '', stderr: json({ ok: false, error: e.code, layer: e.layer }) };
+    }
+    return { code: 1, stdout: '', stderr: json({ ok: false, error: 'internal-error' }) };
+  }
+}
+
 function invokedDirectly(): boolean {
   const entry = process.argv[1];
   if (!entry) return false;
@@ -185,7 +215,7 @@ function invokedDirectly(): boolean {
 }
 
 if (invokedDirectly()) {
-  const r = main(process.argv.slice(2));
+  const r = await runCli(process.argv.slice(2));
   if (r.stdout) process.stdout.write(r.stdout);
   if (r.stderr) process.stderr.write(r.stderr);
   process.exitCode = r.code;
